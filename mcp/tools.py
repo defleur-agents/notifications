@@ -71,3 +71,299 @@ def notifications_recent(since="24h", limit=20):
                       "title": m.get("title", ""), "message": m.get("message", ""),
                       "priority": m.get("priority", 3), "link": m.get("click", "")})
     return {"topic": TOPIC, "since": window, "count": len(items), "notifications": items[-cap:]}
+
+
+# ---- Inbox: the owner's view of everything sent here, with read / flag / archive ----
+# The page and its API live on this front at /notifications/ (the Wizard shell opens it at the same path on its own
+# origin). ntfy keeps the messages (30 days); this keeps only the owner's marks, in a small JSON file.
+import threading
+
+INBOX = "/notifications/"
+STATE_FILE = os.environ.get("INBOX_STATE", "/data/inbox.json")
+TOPICS = [t for t in os.environ.get("INBOX_TOPICS", TOPIC).split(",") if t.strip()]
+_lock = threading.Lock()
+
+
+def _load_state():
+    try:
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(d):
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, STATE_FILE)
+
+
+def _messages(since="all"):
+    out = []
+    for t in TOPICS:
+        status, raw = http("GET", "/%s/json?poll=1&since=%s" % (urllib.parse.quote(t.strip()), since), timeout=20)
+        for line in raw.decode("utf-8", "replace").splitlines():
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("event") == "message":
+                out.append(m)
+    out.sort(key=lambda m: m.get("time", 0), reverse=True)
+    return out
+
+
+def inbox_items(view="inbox", limit=200):
+    st = _load_state()
+    items = []
+    for m in _messages():
+        s = st.get(m["id"], {})
+        tags = m.get("tags") or []
+        it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""),
+              "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
+              "source": "cron" if "cron" in tags else "agent",
+              "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
+        items.append(it)
+    counts = {"unread": sum(1 for i in items if not i["read"] and not i["archived"]),
+              "needs": sum(1 for i in items if not i["read"] and not i["archived"] and i["priority"] >= 4),
+              "flagged": sum(1 for i in items if i["flag"] and not i["archived"])}
+    if view == "flagged":
+        items = [i for i in items if i["flag"] and not i["archived"]]
+    elif view == "archive":
+        items = [i for i in items if i["archived"]]
+    elif view == "all":
+        pass
+    else:
+        items = [i for i in items if not i["archived"]]
+    return {"view": view, "counts": counts, "items": items[:max(1, min(int(limit or 200), 500))]}
+
+
+def inbox_mark(ids, **marks):
+    ids = [str(i)[:40] for i in (ids or [])][:500]
+    keep = {k: bool(v) for k, v in marks.items() if k in ("read", "flag", "archived") and v is not None}
+    if not ids or not keep:
+        raise ValueError("give ids and at least one of read, flag, archived")
+    with _lock:
+        st = _load_state()
+        for i in ids:
+            cur = st.get(i, {})
+            cur.update(keep)
+            if keep.get("archived"):
+                cur["read"] = True
+            st[i] = cur
+        live = {m["id"] for m in _messages()}   # forget marks for messages ntfy has expired
+        st = {k: v for k, v in st.items() if k in live}
+        _save_state(st)
+    return {"ok": True, "changed": len(ids)}
+
+
+@tool("notifications_inbox", "Read the owner's notification inbox (agent notes and scheduled-job results) with what they "
+      "have read, flagged or archived. Use it to answer 'what came in', 'what failed overnight' or 'what did I flag'.",
+      {"view": {"type": "string", "enum": ["inbox", "flagged", "archive", "all"], "description": "default inbox"},
+       "unread_only": {"type": "boolean", "description": "only unread items"},
+       "limit": {"type": "integer", "description": "max items, default 30"}})
+def notifications_inbox(view="inbox", unread_only=False, limit=30):
+    _box_only()
+    d = inbox_items(view, 500)
+    items = [i for i in d["items"] if not (unread_only and i["read"])][:max(1, min(int(limit or 30), 200))]
+    for i in items:
+        i["time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(i["time"]))
+        i["message"] = i["message"][:600]
+    return {"counts": d["counts"], "items": items}
+
+
+@tool("notifications_mark", "Mark inbox items read, unread, flagged or archived for the owner, when they ask.",
+      {"ids": {"type": "array", "items": {"type": "string"}, "description": "item ids from notifications_inbox"},
+       "read": {"type": "boolean"}, "flag": {"type": "boolean"}, "archived": {"type": "boolean"}},
+      ["ids"])
+def notifications_mark(ids, read=None, flag=None, archived=None):
+    _box_only()
+    return inbox_mark(ids, read=read, flag=flag, archived=archived)
+
+
+def _json(code, obj):
+    return code, "application/json", json.dumps(obj).encode()
+
+
+@route(INBOX)
+def inbox_route(method, path, query, headers, body):
+    sub = path[len(INBOX):] if path.startswith(INBOX) else ""
+    q = urllib.parse.parse_qs(query)
+    if method == "GET" and sub in ("", "index.html"):
+        html = MINIMAL_HTML if (q.get("layout") or [""])[0] == "minimal" else PAGE_HTML.replace('<script defer', '<script src="layout.js"></script><script defer')
+        return 200, "text/html; charset=utf-8", html.encode()
+    if method == "GET" and sub in MINIMAL_ASSETS:
+        mime, content = MINIMAL_ASSETS[sub]
+        return 200, mime + "; charset=utf-8", content.encode()
+    if method == "GET" and sub == "inbox.js":
+        return 200, "text/javascript; charset=utf-8", PAGE_JS.encode()
+    if method == "GET" and sub == "inbox.css":
+        return 200, "text/css; charset=utf-8", PAGE_CSS.encode()
+    if method == "GET" and sub == "api/items":
+        return _json(200, inbox_items((q.get("view") or ["inbox"])[0], (q.get("limit") or [200])[0]))
+    if method == "GET" and sub == "api/count":
+        return _json(200, inbox_items("inbox", 1)["counts"])
+    if method == "POST" and sub == "api/mark":
+        # JSON only: a form on another site cannot send this without a CORS preflight, which is never granted.
+        if not headers.get("content-type", "").startswith("application/json"):
+            return _json(415, {"error": "send application/json"})
+        d = json.loads(body or b"{}")
+        return _json(200, inbox_mark(d.get("ids"), read=d.get("read"), flag=d.get("flag"), archived=d.get("archived")))
+    if method == "GET" and sub == "healthz":
+        return _json(200, {"ok": True, "view_revision": MINIMAL_REVISION})
+    return _json(404, {"error": "not found"})
+
+
+PAGE_HTML = """<!doctype html>
+<html lang="en" data-app="notifications">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Notifications</title>
+<script>try { if (window.parent !== window) document.documentElement.classList.add('wz-hosted'); } catch (e) { document.documentElement.classList.add('wz-hosted'); }</script>
+<link rel="stylesheet" href="inbox.css">
+<script src="/wizard-os-home/core/app-client.js" onerror="this.remove()"></script>
+<script defer src="inbox.js"></script>
+</head>
+<body>
+<div class="wz-app">
+  <header class="wz-head"><h1>Notifications</h1></header>
+  <nav class="nt-tabs" role="tablist">
+    <button role="tab" data-view="inbox" aria-selected="true">Inbox <small id="c-inbox"></small></button>
+    <button role="tab" data-view="flagged" aria-selected="false">Flagged <small id="c-flagged"></small></button>
+    <button role="tab" data-view="archive" aria-selected="false">Archive</button>
+    <button class="nt-allread" id="allread" type="button">Mark all read</button>
+  </nav>
+  <main class="wz-scroll" id="scroll"><ul class="wz-list" id="list"></ul>
+    <div class="wz-empty" id="empty" hidden><div class="wz-tile">&#128276;</div><strong>Nothing here</strong><p id="empty-p">Scheduled jobs and your Wizard's notes land here.</p></div>
+  </main>
+  <p class="wz-status" id="status" role="status" aria-live="polite"></p>
+</div>
+</body>
+</html>
+"""
+
+PAGE_CSS = """
+:root { --ink: var(--wz-text, #f3efff); --ink-2: var(--wz-text-secondary, #b9b0d8); --ink-3: var(--wz-text-muted, #a59abf);
+  --line-2: var(--wz-border, rgba(205,190,255,.24)); --line: color-mix(in srgb, var(--line-2) 55%, transparent);
+  --fill: color-mix(in srgb, var(--ink) 6%, transparent); --fill-2: color-mix(in srgb, var(--ink) 10%, transparent);
+  --accent: var(--wz-accent, #b99bff); --on-accent: var(--wz-on-accent, #160b32); --canvas: var(--wz-canvas, #05030c);
+  --danger: #ff8f8f; --amber: #ffbe55; --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color-scheme: dark; }
+html[data-color-scheme="light"] { color-scheme: light; --danger: #b42318; --amber: #a15c00; }
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { font: 15px/1.4 var(--font); color: var(--ink); background: transparent; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+html:not(.wz-hosted) body { background: var(--canvas); }
+button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; padding: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wz-app { display: flex; flex-direction: column; height: 100%; max-width: 680px; margin: 0 auto; }
+.wz-head { flex: none; padding: 18px 18px 4px; }
+.wz-head h1 { margin: 0; font-size: 26px; font-weight: 750; letter-spacing: -.02em; }
+html.wz-hosted .wz-head { display: none; }
+.nt-tabs { flex: none; display: flex; gap: 6px; align-items: center; padding: 10px 10px 6px; overflow-x: auto; scrollbar-width: none; }
+.nt-tabs::-webkit-scrollbar { display: none; }
+.nt-tabs [role=tab] { flex: none; white-space: nowrap; height: 32px; padding: 0 12px; border-radius: 99px; font-size: 14px; font-weight: 600; color: var(--ink-2); background: var(--fill); }
+.nt-tabs [role=tab][aria-selected=true] { color: var(--on-accent); background: var(--accent); }
+.nt-tabs small { font-size: 12px; font-weight: 700; opacity: .8; margin-left: 2px; }
+.nt-allread { flex: none; white-space: nowrap; margin-left: auto; font-size: 13px; color: var(--ink-3); padding: 6px 8px; border-radius: 8px; }
+.wz-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 10px 16px; scrollbar-width: none; }
+.wz-list { list-style: none; margin: 0; padding: 0; }
+.nt-item { border-radius: 14px; }
+.nt-item + .nt-item { margin-top: 2px; }
+.nt-row { display: flex; gap: 12px; width: 100%; padding: 10px 8px; border-radius: 14px; text-align: left; align-items: flex-start; }
+.nt-row:active { background: var(--fill); }
+@media (hover: hover) { .nt-row:hover { background: var(--fill); } }
+.nt-dot { flex: none; width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: transparent; }
+.nt-item.unread .nt-dot { background: var(--accent); }
+.nt-item.unread.p4 .nt-dot, .nt-item.unread.p5 .nt-dot { background: var(--danger); }
+.nt-main { flex: 1; min-width: 0; }
+.nt-top { display: flex; gap: 8px; align-items: baseline; }
+.nt-top b { flex: 1; min-width: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nt-item:not(.unread) .nt-top b { font-weight: 500; color: var(--ink-2); }
+.nt-top time { flex: none; font-size: 12px; color: var(--ink-3); }
+.nt-src { display: inline-block; font-weight: 800; color: var(--danger); margin-right: 5px; }
+.nt-flag { color: var(--amber); font-size: 13px; }
+.nt-msg { margin: 2px 0 0; font-size: 13.5px; color: var(--ink-3); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.nt-item.open .nt-msg { display: block; white-space: pre-wrap; color: var(--ink-2); -webkit-line-clamp: none; }
+.nt-acts { display: none; gap: 6px; padding: 0 8px 10px 28px; flex-wrap: wrap; }
+.nt-item.open .nt-acts { display: flex; }
+.nt-acts button, .nt-acts a { height: 30px; padding: 0 12px; border-radius: 99px; font-size: 13px; font-weight: 600; background: var(--fill); color: var(--ink); display: inline-flex; align-items: center; text-decoration: none; }
+.nt-acts .on { color: var(--amber); }
+.wz-empty { padding: 44px 24px; text-align: center; color: var(--ink-3); }
+.wz-tile { margin: 0 auto 14px; width: 52px; height: 52px; border-radius: 18px; display: grid; place-items: center; font-size: 24px; background: var(--fill); }
+.wz-empty strong { display: block; margin-bottom: 4px; font-size: 16px; color: var(--ink); }
+.wz-empty p { margin: 0 auto; max-width: 32ch; font-size: 14px; }
+.wz-status { flex: none; margin: 0; padding: 0 18px 6px; font-size: 13px; color: var(--danger); }
+.wz-status:empty { padding: 0; }
+html[data-skin="signal"] .nt-row, html[data-skin="signal"] .nt-tabs [role=tab], html[data-skin="signal"] .nt-acts button { border-radius: 2px; }
+"""
+
+PAGE_JS = r"""'use strict';
+(() => {
+  const el = id => document.getElementById(id);
+  let view = 'inbox', items = [], open = '';
+  const ago = t => { const s = Date.now() / 1000 - t; if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm';
+    if (s < 86400) return Math.floor(s / 3600) + 'h'; const d = new Date(t * 1000); return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); };
+  const say = t => { el('status').textContent = t || ''; };
+  async function api(path, data) {
+    const r = await fetch('api/' + path, data ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) } : { cache: 'no-store' });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(b.error || 'Notifications are not reachable right now.');
+    return b;
+  }
+  const plain = t => String(t || '').replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, (m, t) => t).replace(/^\s*[-*]\s+/gm, '').replace(/\*\*|`/g, '').trim();
+  function node(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+  function row(it) {
+    const li = node('li', 'nt-item p' + it.priority + (it.read ? '' : ' unread') + (open === it.id ? ' open' : ''));
+    li.dataset.id = it.id;
+    const b = node('button', 'nt-row'); b.type = 'button'; b.dataset.act = 'toggle'; b.setAttribute('aria-expanded', String(open === it.id));
+    b.appendChild(node('span', 'nt-dot'));
+    const m = node('span', 'nt-main'), top = node('span', 'nt-top');
+    const title = node('b'); if (it.priority >= 4) title.appendChild(node('span', 'nt-src', '!'));
+    title.appendChild(document.createTextNode((it.title || it.message.split('\n')[0]).replace(/^Failed: /, '')));
+    top.appendChild(title); if (it.flag) top.appendChild(node('span', 'nt-flag', '\u2691'));
+    const tm = node('time', '', ago(it.time)); tm.dateTime = new Date(it.time * 1000).toISOString(); top.appendChild(tm);
+    m.appendChild(top); m.appendChild(node('p', 'nt-msg', plain(it.message))); b.appendChild(m); li.appendChild(b);
+    const acts = node('div', 'nt-acts');
+    const btn = (act, label, on) => { const x = node('button', on ? 'on' : '', label); x.type = 'button'; x.dataset.act = act; acts.appendChild(x); };
+    btn('flag', it.flag ? '\u2691 Flagged' : '\u2690 Flag', it.flag);
+    btn('read', it.read ? 'Mark unread' : 'Mark read');
+    btn('archive', it.archived ? 'Move to inbox' : 'Archive');
+    if (/^https:\/\//.test(it.link || '')) { const a = node('a', '', 'Open'); a.href = it.link; a.target = '_blank'; a.rel = 'noopener'; acts.appendChild(a); }
+    li.appendChild(acts);
+    return li;
+  }
+  function paint(d) {
+    items = d.items; const c = d.counts;
+    el('c-inbox').textContent = c.unread ? String(c.unread) : '';
+    el('c-flagged').textContent = c.flagged ? String(c.flagged) : '';
+    el('list').replaceChildren(...items.map(row));
+    el('empty').hidden = items.length > 0;
+    el('empty-p').textContent = view === 'flagged' ? 'Flag a notification to keep it here.' : view === 'archive' ? 'Archived notifications stay here for 30 days.' : 'Scheduled jobs and your Wizard\u2019s notes land here.';
+    el('allread').hidden = view !== 'inbox' || !c.unread;
+    try { parent !== window && parent.postMessage({ type: 'wizard:notifications:count', unread: c.unread, needs: c.needs }, location.origin); } catch (e) {}
+  }
+  async function load() { try { paint(await api('items?view=' + view)); say(''); } catch (e) { say(e.message); } }
+  async function mark(ids, marks) { try { await api('mark', Object.assign({ ids }, marks)); await load(); } catch (e) { say(e.message); } }
+  document.addEventListener('click', e => {
+    const tab = e.target.closest('[role=tab]');
+    if (tab) { view = tab.dataset.view; open = ''; document.querySelectorAll('[role=tab]').forEach(t => t.setAttribute('aria-selected', String(t === tab))); el('scroll').scrollTop = 0; return load(); }
+    if (e.target.closest('#allread')) return mark(items.filter(i => !i.read).map(i => i.id), { read: true });
+    const a = e.target.closest('[data-act]'); const li = e.target.closest('.nt-item'); if (!a || !li) return;
+    const it = items.find(i => i.id === li.dataset.id); if (!it) return;
+    if (a.dataset.act === 'toggle') { open = open === it.id ? '' : it.id; if (open && !it.read) return mark([it.id], { read: true }); return paint({ items, counts: countsNow() }); }
+    if (a.dataset.act === 'flag') return mark([it.id], { flag: !it.flag });
+    if (a.dataset.act === 'read') return mark([it.id], { read: !it.read });
+    if (a.dataset.act === 'archive') { open = ''; return mark([it.id], { archived: !it.archived }); }
+  });
+  function countsNow() { return { unread: Number(el('c-inbox').textContent || 0), flagged: Number(el('c-flagged').textContent || 0), needs: 0 }; }
+  // Back inside the shell: an open item closes first.
+  window.__wizardCloseOverlay = () => { if (!open) return false; open = ''; paint({ items, counts: countsNow() }); return true; };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+  setInterval(() => { if (!document.hidden) load(); }, 60000);
+  load();
+})();
+"""

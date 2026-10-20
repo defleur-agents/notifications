@@ -12,6 +12,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parent.parent
 compose = root / "runtipi" / "docker-compose.yml"
 src = (root / "mcp" / "front.py").read_text() + "\n\n# ---- tools for this app ----\n" + (root / "mcp" / "tools.py").read_text()
+src += "\n" + (root / "mcp" / "minimal_assets.py").read_text()
 src += "\n\nif __name__ == \"__main__\":\n    asyncio.run(main())\n"
 assert "$" not in src, "keep $ out of the MCP front (compose would interpolate it)"
 text = compose.read_text()

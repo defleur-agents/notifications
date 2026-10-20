@@ -54,6 +54,7 @@ services:
       MAX_HEAD = 65536
       MAX_BODY = 1 << 20
       TOOLS = {}
+      ROUTES = {}  # path prefix -> fn(method, path, query, headers, body) -> (status, content_type, bytes); app pages and APIs
       REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
 
 
@@ -63,6 +64,37 @@ services:
               TOOLS[name] = ({"name": name, "description": description, "inputSchema": schema}, fn)
               return fn
           return deco
+
+
+      def route(prefix):
+          def deco(fn):
+              ROUTES[prefix] = fn
+              return fn
+          return deco
+
+
+      async def serve_route(reader, writer, fn, method, target, rest):
+          headers = {}
+          for line in rest.decode("latin-1").split("\r\n"):
+              if ":" in line:
+                  k, v = line.split(":", 1)
+                  headers[k.strip().lower()] = v.strip()
+          n = int(headers.get("content-length") or 0)
+          if n > MAX_BODY:
+              return await respond(writer, 413, {"error": "request too large"})
+          body = await reader.readexactly(n) if n else b""
+          path, _, query = target.partition("?")
+          try:
+              code, ctype, data = await asyncio.to_thread(fn, method, path, query, headers, body)
+          except Exception as e:  # an app route error is a 500 for that request only
+              code, ctype, data = 500, "application/json", json.dumps({"error": "%s: %s" % (type(e).__name__, e)}).encode()
+          head = "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n" % (
+              code, REASONS.get(code, "OK"), ctype, len(data))
+          writer.write(head.encode() + data)
+          try:
+              await writer.drain()
+          finally:
+              writer.close()
 
 
       def up_addr():
@@ -113,7 +145,7 @@ services:
 
 
       REASONS = {200: "OK", 202: "Accepted", 400: "Bad Request", 404: "Not Found", 405: "Method Not Allowed",
-                 401: "Unauthorized", 413: "Payload Too Large", 502: "Bad Gateway"}
+                 401: "Unauthorized", 403: "Forbidden", 415: "Unsupported Media Type", 500: "Internal Server Error", 413: "Payload Too Large", 502: "Bad Gateway"}
 
 
       async def respond(writer, code, obj=None, extra=""):
@@ -184,6 +216,9 @@ services:
           path = parts[1].split("?", 1)[0] if len(parts) >= 3 else ""
           if path == MCP_PATH:
               return await mcp(reader, writer, parts[0], rest)
+          for prefix, fn in ROUTES.items():
+              if path == prefix.rstrip("/") or path.startswith(prefix):
+                  return await serve_route(reader, writer, fn, parts[0], parts[1], rest)
           if not UP_HOST:
               return await respond(writer, 404, {"error": "not found"})
           try:
@@ -281,6 +316,306 @@ services:
                             "title": m.get("title", ""), "message": m.get("message", ""),
                             "priority": m.get("priority", 3), "link": m.get("click", "")})
           return {"topic": TOPIC, "since": window, "count": len(items), "notifications": items[-cap:]}
+
+
+      # ---- Inbox: the owner's view of everything sent here, with read / flag / archive ----
+      # The page and its API live on this front at /notifications/ (the Wizard shell opens it at the same path on its own
+      # origin). ntfy keeps the messages (30 days); this keeps only the owner's marks, in a small JSON file.
+      import threading
+
+      INBOX = "/notifications/"
+      STATE_FILE = os.environ.get("INBOX_STATE", "/data/inbox.json")
+      TOPICS = [t for t in os.environ.get("INBOX_TOPICS", TOPIC).split(",") if t.strip()]
+      _lock = threading.Lock()
+
+
+      def _load_state():
+          try:
+              with open(STATE_FILE) as f:
+                  d = json.load(f)
+              return d if isinstance(d, dict) else {}
+          except (OSError, ValueError):
+              return {}
+
+
+      def _save_state(d):
+          tmp = STATE_FILE + ".tmp"
+          with open(tmp, "w") as f:
+              json.dump(d, f)
+          os.replace(tmp, STATE_FILE)
+
+
+      def _messages(since="all"):
+          out = []
+          for t in TOPICS:
+              status, raw = http("GET", "/%s/json?poll=1&since=%s" % (urllib.parse.quote(t.strip()), since), timeout=20)
+              for line in raw.decode("utf-8", "replace").splitlines():
+                  try:
+                      m = json.loads(line)
+                  except ValueError:
+                      continue
+                  if m.get("event") == "message":
+                      out.append(m)
+          out.sort(key=lambda m: m.get("time", 0), reverse=True)
+          return out
+
+
+      def inbox_items(view="inbox", limit=200):
+          st = _load_state()
+          items = []
+          for m in _messages():
+              s = st.get(m["id"], {})
+              tags = m.get("tags") or []
+              it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""),
+                    "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
+                    "source": "cron" if "cron" in tags else "agent",
+                    "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
+              items.append(it)
+          counts = {"unread": sum(1 for i in items if not i["read"] and not i["archived"]),
+                    "needs": sum(1 for i in items if not i["read"] and not i["archived"] and i["priority"] >= 4),
+                    "flagged": sum(1 for i in items if i["flag"] and not i["archived"])}
+          if view == "flagged":
+              items = [i for i in items if i["flag"] and not i["archived"]]
+          elif view == "archive":
+              items = [i for i in items if i["archived"]]
+          elif view == "all":
+              pass
+          else:
+              items = [i for i in items if not i["archived"]]
+          return {"view": view, "counts": counts, "items": items[:max(1, min(int(limit or 200), 500))]}
+
+
+      def inbox_mark(ids, **marks):
+          ids = [str(i)[:40] for i in (ids or [])][:500]
+          keep = {k: bool(v) for k, v in marks.items() if k in ("read", "flag", "archived") and v is not None}
+          if not ids or not keep:
+              raise ValueError("give ids and at least one of read, flag, archived")
+          with _lock:
+              st = _load_state()
+              for i in ids:
+                  cur = st.get(i, {})
+                  cur.update(keep)
+                  if keep.get("archived"):
+                      cur["read"] = True
+                  st[i] = cur
+              live = {m["id"] for m in _messages()}   # forget marks for messages ntfy has expired
+              st = {k: v for k, v in st.items() if k in live}
+              _save_state(st)
+          return {"ok": True, "changed": len(ids)}
+
+
+      @tool("notifications_inbox", "Read the owner's notification inbox (agent notes and scheduled-job results) with what they "
+            "have read, flagged or archived. Use it to answer 'what came in', 'what failed overnight' or 'what did I flag'.",
+            {"view": {"type": "string", "enum": ["inbox", "flagged", "archive", "all"], "description": "default inbox"},
+             "unread_only": {"type": "boolean", "description": "only unread items"},
+             "limit": {"type": "integer", "description": "max items, default 30"}})
+      def notifications_inbox(view="inbox", unread_only=False, limit=30):
+          _box_only()
+          d = inbox_items(view, 500)
+          items = [i for i in d["items"] if not (unread_only and i["read"])][:max(1, min(int(limit or 30), 200))]
+          for i in items:
+              i["time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(i["time"]))
+              i["message"] = i["message"][:600]
+          return {"counts": d["counts"], "items": items}
+
+
+      @tool("notifications_mark", "Mark inbox items read, unread, flagged or archived for the owner, when they ask.",
+            {"ids": {"type": "array", "items": {"type": "string"}, "description": "item ids from notifications_inbox"},
+             "read": {"type": "boolean"}, "flag": {"type": "boolean"}, "archived": {"type": "boolean"}},
+            ["ids"])
+      def notifications_mark(ids, read=None, flag=None, archived=None):
+          _box_only()
+          return inbox_mark(ids, read=read, flag=flag, archived=archived)
+
+
+      def _json(code, obj):
+          return code, "application/json", json.dumps(obj).encode()
+
+
+      @route(INBOX)
+      def inbox_route(method, path, query, headers, body):
+          sub = path[len(INBOX):] if path.startswith(INBOX) else ""
+          q = urllib.parse.parse_qs(query)
+          if method == "GET" and sub in ("", "index.html"):
+              html = MINIMAL_HTML if (q.get("layout") or [""])[0] == "minimal" else PAGE_HTML.replace('<script defer', '<script src="layout.js"></script><script defer')
+              return 200, "text/html; charset=utf-8", html.encode()
+          if method == "GET" and sub in MINIMAL_ASSETS:
+              mime, content = MINIMAL_ASSETS[sub]
+              return 200, mime + "; charset=utf-8", content.encode()
+          if method == "GET" and sub == "inbox.js":
+              return 200, "text/javascript; charset=utf-8", PAGE_JS.encode()
+          if method == "GET" and sub == "inbox.css":
+              return 200, "text/css; charset=utf-8", PAGE_CSS.encode()
+          if method == "GET" and sub == "api/items":
+              return _json(200, inbox_items((q.get("view") or ["inbox"])[0], (q.get("limit") or [200])[0]))
+          if method == "GET" and sub == "api/count":
+              return _json(200, inbox_items("inbox", 1)["counts"])
+          if method == "POST" and sub == "api/mark":
+              # JSON only: a form on another site cannot send this without a CORS preflight, which is never granted.
+              if not headers.get("content-type", "").startswith("application/json"):
+                  return _json(415, {"error": "send application/json"})
+              d = json.loads(body or b"{}")
+              return _json(200, inbox_mark(d.get("ids"), read=d.get("read"), flag=d.get("flag"), archived=d.get("archived")))
+          if method == "GET" and sub == "healthz":
+              return _json(200, {"ok": True, "view_revision": MINIMAL_REVISION})
+          return _json(404, {"error": "not found"})
+
+
+      PAGE_HTML = """<!doctype html>
+      <html lang="en" data-app="notifications">
+      <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+      <meta name="color-scheme" content="dark light">
+      <title>Notifications</title>
+      <script>try { if (window.parent !== window) document.documentElement.classList.add('wz-hosted'); } catch (e) { document.documentElement.classList.add('wz-hosted'); }</script>
+      <link rel="stylesheet" href="inbox.css">
+      <script src="/wizard-os-home/core/app-client.js" onerror="this.remove()"></script>
+      <script defer src="inbox.js"></script>
+      </head>
+      <body>
+      <div class="wz-app">
+        <header class="wz-head"><h1>Notifications</h1></header>
+        <nav class="nt-tabs" role="tablist">
+          <button role="tab" data-view="inbox" aria-selected="true">Inbox <small id="c-inbox"></small></button>
+          <button role="tab" data-view="flagged" aria-selected="false">Flagged <small id="c-flagged"></small></button>
+          <button role="tab" data-view="archive" aria-selected="false">Archive</button>
+          <button class="nt-allread" id="allread" type="button">Mark all read</button>
+        </nav>
+        <main class="wz-scroll" id="scroll"><ul class="wz-list" id="list"></ul>
+          <div class="wz-empty" id="empty" hidden><div class="wz-tile">&#128276;</div><strong>Nothing here</strong><p id="empty-p">Scheduled jobs and your Wizard's notes land here.</p></div>
+        </main>
+        <p class="wz-status" id="status" role="status" aria-live="polite"></p>
+      </div>
+      </body>
+      </html>
+      """
+
+      PAGE_CSS = """
+      :root { --ink: var(--wz-text, #f3efff); --ink-2: var(--wz-text-secondary, #b9b0d8); --ink-3: var(--wz-text-muted, #a59abf);
+        --line-2: var(--wz-border, rgba(205,190,255,.24)); --line: color-mix(in srgb, var(--line-2) 55%, transparent);
+        --fill: color-mix(in srgb, var(--ink) 6%, transparent); --fill-2: color-mix(in srgb, var(--ink) 10%, transparent);
+        --accent: var(--wz-accent, #b99bff); --on-accent: var(--wz-on-accent, #160b32); --canvas: var(--wz-canvas, #05030c);
+        --danger: #ff8f8f; --amber: #ffbe55; --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color-scheme: dark; }
+      html[data-color-scheme="light"] { color-scheme: light; --danger: #b42318; --amber: #a15c00; }
+      *, *::before, *::after { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body { font: 15px/1.4 var(--font); color: var(--ink); background: transparent; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+      html:not(.wz-hosted) body { background: var(--canvas); }
+      button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; padding: 0; }
+      :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .wz-app { display: flex; flex-direction: column; height: 100%; max-width: 680px; margin: 0 auto; }
+      .wz-head { flex: none; padding: 18px 18px 4px; }
+      .wz-head h1 { margin: 0; font-size: 26px; font-weight: 750; letter-spacing: -.02em; }
+      html.wz-hosted .wz-head { display: none; }
+      .nt-tabs { flex: none; display: flex; gap: 6px; align-items: center; padding: 10px 10px 6px; overflow-x: auto; scrollbar-width: none; }
+      .nt-tabs::-webkit-scrollbar { display: none; }
+      .nt-tabs [role=tab] { flex: none; white-space: nowrap; height: 32px; padding: 0 12px; border-radius: 99px; font-size: 14px; font-weight: 600; color: var(--ink-2); background: var(--fill); }
+      .nt-tabs [role=tab][aria-selected=true] { color: var(--on-accent); background: var(--accent); }
+      .nt-tabs small { font-size: 12px; font-weight: 700; opacity: .8; margin-left: 2px; }
+      .nt-allread { flex: none; white-space: nowrap; margin-left: auto; font-size: 13px; color: var(--ink-3); padding: 6px 8px; border-radius: 8px; }
+      .wz-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 10px 16px; scrollbar-width: none; }
+      .wz-list { list-style: none; margin: 0; padding: 0; }
+      .nt-item { border-radius: 14px; }
+      .nt-item + .nt-item { margin-top: 2px; }
+      .nt-row { display: flex; gap: 12px; width: 100%; padding: 10px 8px; border-radius: 14px; text-align: left; align-items: flex-start; }
+      .nt-row:active { background: var(--fill); }
+      @media (hover: hover) { .nt-row:hover { background: var(--fill); } }
+      .nt-dot { flex: none; width: 8px; height: 8px; margin-top: 7px; border-radius: 50%; background: transparent; }
+      .nt-item.unread .nt-dot { background: var(--accent); }
+      .nt-item.unread.p4 .nt-dot, .nt-item.unread.p5 .nt-dot { background: var(--danger); }
+      .nt-main { flex: 1; min-width: 0; }
+      .nt-top { display: flex; gap: 8px; align-items: baseline; }
+      .nt-top b { flex: 1; min-width: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .nt-item:not(.unread) .nt-top b { font-weight: 500; color: var(--ink-2); }
+      .nt-top time { flex: none; font-size: 12px; color: var(--ink-3); }
+      .nt-src { display: inline-block; font-weight: 800; color: var(--danger); margin-right: 5px; }
+      .nt-flag { color: var(--amber); font-size: 13px; }
+      .nt-msg { margin: 2px 0 0; font-size: 13.5px; color: var(--ink-3); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+      .nt-item.open .nt-msg { display: block; white-space: pre-wrap; color: var(--ink-2); -webkit-line-clamp: none; }
+      .nt-acts { display: none; gap: 6px; padding: 0 8px 10px 28px; flex-wrap: wrap; }
+      .nt-item.open .nt-acts { display: flex; }
+      .nt-acts button, .nt-acts a { height: 30px; padding: 0 12px; border-radius: 99px; font-size: 13px; font-weight: 600; background: var(--fill); color: var(--ink); display: inline-flex; align-items: center; text-decoration: none; }
+      .nt-acts .on { color: var(--amber); }
+      .wz-empty { padding: 44px 24px; text-align: center; color: var(--ink-3); }
+      .wz-tile { margin: 0 auto 14px; width: 52px; height: 52px; border-radius: 18px; display: grid; place-items: center; font-size: 24px; background: var(--fill); }
+      .wz-empty strong { display: block; margin-bottom: 4px; font-size: 16px; color: var(--ink); }
+      .wz-empty p { margin: 0 auto; max-width: 32ch; font-size: 14px; }
+      .wz-status { flex: none; margin: 0; padding: 0 18px 6px; font-size: 13px; color: var(--danger); }
+      .wz-status:empty { padding: 0; }
+      html[data-skin="signal"] .nt-row, html[data-skin="signal"] .nt-tabs [role=tab], html[data-skin="signal"] .nt-acts button { border-radius: 2px; }
+      """
+
+      PAGE_JS = r"""'use strict';
+      (() => {
+        const el = id => document.getElementById(id);
+        let view = 'inbox', items = [], open = '';
+        const ago = t => { const s = Date.now() / 1000 - t; if (s < 60) return 'now'; if (s < 3600) return Math.floor(s / 60) + 'm';
+          if (s < 86400) return Math.floor(s / 3600) + 'h'; const d = new Date(t * 1000); return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' }); };
+        const say = t => { el('status').textContent = t || ''; };
+        async function api(path, data) {
+          const r = await fetch('api/' + path, data ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) } : { cache: 'no-store' });
+          const b = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(b.error || 'Notifications are not reachable right now.');
+          return b;
+        }
+        const plain = t => String(t || '').replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, (m, t) => t).replace(/^\s*[-*]\s+/gm, '').replace(/\*\*|`/g, '').trim();
+        function node(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+        function row(it) {
+          const li = node('li', 'nt-item p' + it.priority + (it.read ? '' : ' unread') + (open === it.id ? ' open' : ''));
+          li.dataset.id = it.id;
+          const b = node('button', 'nt-row'); b.type = 'button'; b.dataset.act = 'toggle'; b.setAttribute('aria-expanded', String(open === it.id));
+          b.appendChild(node('span', 'nt-dot'));
+          const m = node('span', 'nt-main'), top = node('span', 'nt-top');
+          const title = node('b'); if (it.priority >= 4) title.appendChild(node('span', 'nt-src', '!'));
+          title.appendChild(document.createTextNode((it.title || it.message.split('\n')[0]).replace(/^Failed: /, '')));
+          top.appendChild(title); if (it.flag) top.appendChild(node('span', 'nt-flag', '\u2691'));
+          const tm = node('time', '', ago(it.time)); tm.dateTime = new Date(it.time * 1000).toISOString(); top.appendChild(tm);
+          m.appendChild(top); m.appendChild(node('p', 'nt-msg', plain(it.message))); b.appendChild(m); li.appendChild(b);
+          const acts = node('div', 'nt-acts');
+          const btn = (act, label, on) => { const x = node('button', on ? 'on' : '', label); x.type = 'button'; x.dataset.act = act; acts.appendChild(x); };
+          btn('flag', it.flag ? '\u2691 Flagged' : '\u2690 Flag', it.flag);
+          btn('read', it.read ? 'Mark unread' : 'Mark read');
+          btn('archive', it.archived ? 'Move to inbox' : 'Archive');
+          if (/^https:\/\//.test(it.link || '')) { const a = node('a', '', 'Open'); a.href = it.link; a.target = '_blank'; a.rel = 'noopener'; acts.appendChild(a); }
+          li.appendChild(acts);
+          return li;
+        }
+        function paint(d) {
+          items = d.items; const c = d.counts;
+          el('c-inbox').textContent = c.unread ? String(c.unread) : '';
+          el('c-flagged').textContent = c.flagged ? String(c.flagged) : '';
+          el('list').replaceChildren(...items.map(row));
+          el('empty').hidden = items.length > 0;
+          el('empty-p').textContent = view === 'flagged' ? 'Flag a notification to keep it here.' : view === 'archive' ? 'Archived notifications stay here for 30 days.' : 'Scheduled jobs and your Wizard\u2019s notes land here.';
+          el('allread').hidden = view !== 'inbox' || !c.unread;
+          try { parent !== window && parent.postMessage({ type: 'wizard:notifications:count', unread: c.unread, needs: c.needs }, location.origin); } catch (e) {}
+        }
+        async function load() { try { paint(await api('items?view=' + view)); say(''); } catch (e) { say(e.message); } }
+        async function mark(ids, marks) { try { await api('mark', Object.assign({ ids }, marks)); await load(); } catch (e) { say(e.message); } }
+        document.addEventListener('click', e => {
+          const tab = e.target.closest('[role=tab]');
+          if (tab) { view = tab.dataset.view; open = ''; document.querySelectorAll('[role=tab]').forEach(t => t.setAttribute('aria-selected', String(t === tab))); el('scroll').scrollTop = 0; return load(); }
+          if (e.target.closest('#allread')) return mark(items.filter(i => !i.read).map(i => i.id), { read: true });
+          const a = e.target.closest('[data-act]'); const li = e.target.closest('.nt-item'); if (!a || !li) return;
+          const it = items.find(i => i.id === li.dataset.id); if (!it) return;
+          if (a.dataset.act === 'toggle') { open = open === it.id ? '' : it.id; if (open && !it.read) return mark([it.id], { read: true }); return paint({ items, counts: countsNow() }); }
+          if (a.dataset.act === 'flag') return mark([it.id], { flag: !it.flag });
+          if (a.dataset.act === 'read') return mark([it.id], { read: !it.read });
+          if (a.dataset.act === 'archive') { open = ''; return mark([it.id], { archived: !it.archived }); }
+        });
+        function countsNow() { return { unread: Number(el('c-inbox').textContent || 0), flagged: Number(el('c-flagged').textContent || 0), needs: 0 }; }
+        // Back inside the shell: an open item closes first.
+        window.__wizardCloseOverlay = () => { if (!open) return false; open = ''; paint({ items, counts: countsNow() }); return true; };
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+        setInterval(() => { if (!document.hidden) load(); }, 60000);
+        load();
+      })();
+      """
+
+      MINIMAL_REVISION = '4441d4a283bfb1ae5f82eee1bf1cdbb4eb9f75e6703d76b6265ec608f0ea0719'
+      MINIMAL_HTML = '<!doctype html>\n<html lang="en" data-app="notifications">\n<head>\n<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="dark light">\n<title>Notifications</title>\n<script src="minimal-boot.js"></script><link rel="stylesheet" href="minimal-kit.css"><link rel="stylesheet" href="minimal.css">\n<script src="/wizard-os-home/core/app-client.js"></script><script src="layout.js"></script><script defer src="minimal.js"></script>\n</head>\n<body><div class="wz-app">\n<header class="wz-head"><h1>Notifications</h1></header>\n<main class="wz-scroll" id="scroll" tabindex="-1">\n<section id="overview" aria-label="Notification subjects"><ul class="wz-list" id="list"></ul><p class="wz-empty" id="empty" hidden>No unread notifications</p></section>\n<section id="detail" aria-labelledby="subject" hidden><button type="button" id="back">← Back</button><h2 id="subject" tabindex="-1"></h2><p id="meta"></p><div id="body"></div><div class="actions" id="actions"></div><p id="reply-note">Opens an unsent draft with this notification as quoted reference data. Review it in Chats; nothing is sent automatically.</p></section>\n</main>\n<p class="wz-status" id="status" role="status" aria-live="polite"></p>\n<footer id="toolbar"><nav aria-label="Notification filter" id="filters"><button type="button" data-filter="unread" aria-pressed="true">Unread</button><button type="button" data-filter="all" aria-pressed="false">All</button></nav><button type="button" id="more" aria-expanded="false" aria-controls="options">More</button><div id="options" hidden><button type="button" data-filter="flagged">Flagged</button><button type="button" data-filter="archive">Archive</button><button type="button" id="allread">Mark all read</button><button type="button" id="refresh">Refresh</button></div></footer>\n</div></body></html>\n'
+      MINIMAL_ASSETS = {'minimal.js': ('text/javascript', "'use strict';\n(() => {\n  const el = id => document.getElementById(id);\n  let filter = 'unread', items = [], selected = null, generation = 0, busy = false;\n  const titleOf = it => String(it.title || String(it.message || '').split('\\n')[0] || 'Untitled notification');\n  const say = text => { el('status').textContent = text || ''; };\n  function node(tag, text, cls) { const n = document.createElement(tag); if (text != null) n.textContent = String(text); if (cls) n.className = cls; return n; }\n  async function api(path, data) {\n    const response = await fetch('api/' + path, data ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)} : {cache: 'no-store'});\n    const result = await response.json();\n    if (!response.ok) throw new Error(result.error || 'Notifications are not reachable. Try Refresh.');\n    return result;\n  }\n  function visible() { return filter === 'unread' ? items.filter(it => !it.read) : items; }\n  function paint() {\n    el('list').replaceChildren(...visible().map(it => {\n      const li = node('li'), button = node('button', null, 'subject-row' + (it.read ? '' : ' unread'));\n      button.type = 'button'; button.dataset.id = it.id;\n      button.setAttribute('aria-label', titleOf(it) + (it.read ? '' : ', unread'));\n      const dot = node('span', '', 'dot'); dot.setAttribute('aria-hidden', 'true');\n      button.append(dot, node('span', titleOf(it), 'title')); li.append(button); return li;\n    }));\n    el('empty').hidden = visible().length !== 0;\n    el('empty').textContent = filter === 'unread' ? 'No unread notifications' : filter === 'flagged' ? 'No flagged notifications' : filter === 'archive' ? 'No archived notifications' : 'No notifications';\n    document.querySelectorAll('[data-filter]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.filter === filter)));\n    el('overview').hidden = !!selected; el('detail').hidden = !selected;\n    if (selected) paintDetail();\n  }\n  function action(label, handler, disabled = false) {\n    const b = node('button', label); b.type = 'button'; b.disabled = disabled || busy; b.onclick = handler; return b;\n  }\n  function paintDetail() {\n    const it = selected;\n    el('subject').textContent = titleOf(it);\n    const date = new Date(Number(it.time) * 1000);\n    el('meta').textContent = [Number.isNaN(date.getTime()) ? '' : date.toLocaleString(), it.read ? 'Read' : 'Unread', it.flag ? 'Flagged' : '', it.archived ? 'Archived' : ''].filter(Boolean).join(' · ');\n    el('body').textContent = String(it.message || '');\n    const a = el('actions'); a.replaceChildren();\n    const reply = action('Start chat', () => {\n      try {\n        const receipt = window.WizardApp.nav.openContextDraft({id: String(it.id), title: titleOf(it), message: String(it.message || '')});\n        if (receipt?.kind !== 'unsent-draft' || receipt.sent !== false) throw new Error('Could not confirm an unsent draft.');\n        say('Draft opened in Chats. Nothing sent.');\n      } catch (error) { say(error.message || 'Could not open Chats.'); }\n    }); reply.setAttribute('aria-describedby', 'reply-note'); a.append(reply);\n    a.append(action(it.read ? 'Mark unread' : 'Mark read', () => mark([it.id], {read: !it.read})));\n    a.append(action(it.flag ? 'Unflag' : 'Flag', () => mark([it.id], {flag: !it.flag})));\n    a.append(action(it.archived ? 'Move to inbox' : 'Archive', () => mark([it.id], {archived: !it.archived})));\n    try {\n      const url = new URL(it.link);\n      if (url.protocol === 'https:') { const link = node('a', 'Open link'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; a.append(link); }\n    } catch (_) {}\n  }\n  async function load() {\n    const version = ++generation;\n    const view = filter === 'unread' ? 'inbox' : filter;\n    try {\n      const result = await api('items?view=' + encodeURIComponent(view) + '&limit=500');\n      if (version !== generation) return;\n      if (!Array.isArray(result.items)) throw new Error('Notifications returned an invalid list.');\n      items = result.items;\n      if (selected) selected = items.find(it => it.id === selected.id) || selected;\n      paint(); say('');\n      const c = result.counts || {};\n      if (parent !== window) parent.postMessage({type: 'wizard:notifications:count', unread: Number(c.unread) || 0, needs: Number(c.needs) || 0}, location.origin);\n    } catch (error) { if (version === generation) say(error.message); }\n  }\n  async function mark(ids, marks) {\n    if (busy || !ids.length) return;\n    busy = true; if (selected) paintDetail();\n    try {\n      await api('mark', {ids, ...marks});\n      if (selected && ids.includes(selected.id)) selected = {...selected, ...marks};\n      await load();\n    } catch (error) { say(error.message); }\n    finally { busy = false; if (selected) paintDetail(); }\n  }\n  function closeDetail() {\n    if (!selected) return false;\n    const id = selected.id; selected = null; paint();\n    const row = [...document.querySelectorAll('.subject-row')].find(b => b.dataset.id === id); (row || el('scroll')).focus(); return true;\n  }\n  el('list').onclick = e => {\n    const b = e.target.closest('[data-id]'); if (!b) return;\n    selected = items.find(it => it.id === b.dataset.id); if (!selected) return;\n    paint(); el('scroll').scrollTop = 0; el('subject').focus();\n  };\n  document.querySelectorAll('[data-filter]').forEach(b => b.onclick = () => {\n    filter = b.dataset.filter; selected = null; el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('scroll').scrollTop = 0;\n    // Clear old rows while the new filter loads, never label stale data “All”.\n    items = []; paint(); load();\n  });\n  el('back').onclick = closeDetail;\n  el('more').onclick = () => { el('options').hidden = !el('options').hidden; el('more').setAttribute('aria-expanded', String(!el('options').hidden)); };\n  el('refresh').onclick = load;\n  el('allread').onclick = () => {\n    const ids = visible().filter(it => !it.read).map(it => it.id);\n    if (ids.length && confirm('Mark the ' + ids.length + ' displayed notifications as read?')) mark(ids, {read: true});\n  };\n  window.__wizardCloseOverlay = () => {\n    if (!el('options').hidden) { el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('more').focus(); return true; }\n    return closeDetail();\n  };\n  document.addEventListener('keydown', e => { if (e.key === 'Escape') window.__wizardCloseOverlay(); });\n  window.WizardApp?.ready({name: 'Notifications'});\n  window.WizardApp?.back?.register?.({canGoBack: () => !!selected || !el('options').hidden, back: () => window.__wizardCloseOverlay()});\n  document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });\n  setInterval(() => { if (!document.hidden && !busy) load(); }, 60000);\n  load();\n})();\n"), 'minimal.css': ('text/css', '.wz-app { max-width: 760px; width: 100%; }\n.wz-scroll { padding: 8px 18px; overscroll-behavior: contain; }\n[hidden] { display: none !important; }\nbutton, a { -webkit-tap-highlight-color: transparent; }\nbutton { min-height: 44px; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; }\nbutton:disabled { cursor: not-allowed; color: var(--ink-3); }\n:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }\n.subject-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 56px; text-align: left; border-bottom: 1px solid var(--line); padding: 10px 2px; }\n.subject-row:hover { background: var(--fill); }\n.subject-row .title { min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 450; }\n.subject-row.unread .title { font-weight: 650; }\n.dot { flex: 0 0 6px; width: 6px; height: 6px; border-radius: 50%; background: transparent; }\n.unread .dot { background: var(--accent); }\n#toolbar { flex: none; position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 18px max(44px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); }\n#filters { display: flex; border-radius: 99px; background: var(--fill); padding: 3px; }\n#filters button { min-width: 90px; padding: 0 18px; border-radius: 99px; color: var(--ink-2); }\n#filters button[aria-pressed="true"] { background: var(--fill-2); color: var(--ink); font-weight: 650; }\n#more { color: var(--ink-2); padding: 0 10px; }\n#options { position: absolute; right: 18px; bottom: calc(100% + 4px); min-width: 170px; padding: 8px; border: 1px solid var(--line-2); border-radius: 16px; background: var(--wz-surface-raised, var(--canvas)); box-shadow: 0 10px 36px var(--line); z-index: 3; }\n#options button { display: block; width: 100%; padding: 0 12px; text-align: left; border-radius: 8px; }\n#options button:hover { background: var(--fill); }\n#back { color: var(--ink-2); padding: 0 4px; }\n#subject { font-size: 22px; line-height: 1.3; margin: 16px 0 8px; overflow-wrap: anywhere; }\n#meta, #reply-note { font-size: 13px; color: var(--ink-2); }\n#body { margin: 24px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }\n.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0 10px; }\n.actions button, .actions a { border-radius: 99px; padding: 10px 16px; background: var(--fill); text-decoration: none; display: inline-flex; align-items: center; color: var(--ink); }\n.actions button:disabled { color: var(--ink-3); }\n#reply-note { max-width: 52ch; line-height: 1.5; }\n.wz-status { color: var(--ink-2); padding: 0 18px; }\n.wz-status:empty { padding: 0; margin: 0; }\n@media (min-width: 768px) { #toolbar { order: -1; justify-content: flex-start; border-top: 0; border-bottom: 1px solid var(--line); } #options { top: calc(100% + 4px); bottom: auto; left: 18px; right: auto; } .wz-head { order: -2; } }\n'), 'minimal-kit.css': ('text/css', '/* Wizard UI kit for generated apps (builder template, MVP).\n *\n * Rule 1: a hosted app paints NO canvas. In a window or fullscreen the shell\'s window glass is the\n *         canvas, exactly as it is for Chats. Only a standalone tab paints the skin\'s background.\n * Rule 2: speak Chats\' visual language: system UI type at the shell\'s sizes, ink / ink-2 / ink-3\n *         hierarchy, hairline separators, faint tinted fills instead of opaque cards, pill inputs,\n *         a round accent action. Every value derives from the appearance v1 roles (--wz-*), so all\n *         the five accepted skins and future shell-approved skins flow through without per-app colour work.\n * Rule 3: layout and content stay the app\'s own. Use these classes; add app styles in styles.css.\n *\n * Values mirror web/core/chats.css and core/base.css in Wizard UX (ch-row, ch-sec-h, ch-compose). */\n\n:root {\n  --ink: var(--wz-text, #f3efff);\n  --ink-2: var(--wz-text-secondary, #b9b0d8);\n  --ink-3: var(--wz-text-muted, #a59abf);\n  --line-2: var(--wz-border, rgba(205, 190, 255, .24));\n  --line: color-mix(in srgb, var(--line-2) 55%, transparent);\n  --fill: color-mix(in srgb, var(--ink) 6%, transparent);\n  --fill-2: color-mix(in srgb, var(--ink) 10%, transparent);\n  --accent: var(--wz-accent, #b99bff);\n  --on-accent: var(--wz-on-accent, #160b32);\n  --accent-soft: var(--wz-accent-soft, rgba(143, 99, 255, .16));\n  --canvas: var(--wz-canvas, #05030c);\n  --danger: #ff8f8f;\n  --r: 14px;          /* rows, panels */\n  --r-tile: 12px;     /* 36px tiles, search */\n  --r-pill: 20px;     /* composer input */\n  --ease: cubic-bezier(.2, .9, .25, 1);\n  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;\n  color-scheme: dark;\n}\nhtml[data-color-scheme="light"] { color-scheme: light; --danger: #b42318; }\n/* Skin shape. The protocol carries colour only today; these two skins also change shape in the shell. */\nhtml[data-skin="signal"] { --r: 2px; --r-tile: 2px; --r-pill: 2px; }\nhtml[data-skin="signal"] .wz-sec-h { font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .08em; }\n\n*, *::before, *::after { box-sizing: border-box; }\nhtml, body { height: 100%; margin: 0; }\nhtml { -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }\nbody { font: 15px/1.4 var(--font); color: var(--ink); background: transparent; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }\nhtml[data-presentation="standalone"]:not(.wz-hosted) body { background: var(--canvas); }\nbutton, input, textarea, select { font: inherit; color: inherit; }\nbutton { cursor: pointer; border: 0; background: none; padding: 0; }\n:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }\n.wz-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }\n\n/* ---------- frame: head / scroll / composer, like a Chats thread ---------- */\n.wz-app { display: flex; flex-direction: column; height: 100%; max-width: 640px; margin: 0 auto; }\n.wz-head { flex: none; display: flex; align-items: flex-end; gap: 12px; padding: calc(var(--wos-cutout, 0px) + 18px) 18px 6px; }\n.wz-head h1 { margin: 0; font-size: 26px; line-height: 1.15; font-weight: 750; letter-spacing: -.02em; }\n.wz-head p { margin: 0 0 3px auto; font-size: 13px; color: var(--ink-3); }\n/* In a window the shell\'s title bar already names the app. */\nhtml[data-presentation="window"] .wz-head { display: none; }\n.wz-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 10px 12px; scrollbar-width: none; }\n.wz-scroll::-webkit-scrollbar { display: none; }\n\n/* ---------- section label: .ch-sec-h ---------- */\n.wz-sec + .wz-sec { border-top: 1px solid var(--line); }\n.wz-sec-h { display: flex; align-items: center; gap: 10px; margin: 0; padding: 12px 8px 8px; font-size: 11.5px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }\n.wz-sec-h small { font-size: 11.5px; font-weight: 800; letter-spacing: .05em; color: var(--ink-3); }\n.wz-count { margin-left: auto; padding: 1px 8px; border-radius: 99px; font-size: 10.5px; letter-spacing: .04em; color: var(--ink-2); background: var(--fill); }\n.wz-count.all { color: var(--on-accent); background: var(--accent); }\n\n/* ---------- rows: .ch-row ---------- */\n.wz-list { list-style: none; margin: 0; padding: 0; }\n.wz-row { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 52px; padding: 8px; border-radius: var(--r); text-align: left; transition: background 140ms; }\n.wz-row:active { background: var(--fill); }\n@media (hover: hover) { .wz-row:hover { background: var(--fill); } }\n.wz-row .wz-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }\n.wz-row .wz-main b { font-size: 15px; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }\n.wz-row .wz-main small { font-size: 13px; color: var(--ink-3); }\n.wz-tile { flex: none; width: 36px; height: 36px; border-radius: var(--r-tile); display: grid; place-items: center; font-size: 18px; background: var(--fill); }\n\n/* round check, 26px inside a 36px tile-sized slot (the whole row is the 44px+ target) */\n.wz-check { flex: none; width: 36px; height: 36px; display: grid; place-items: center; }\n.wz-check i { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--line-2); display: grid; place-items: center; transition: background 160ms var(--ease), border-color 160ms, transform 220ms var(--ease); }\n.wz-check svg { width: 14px; height: 14px; fill: none; stroke: var(--on-accent); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: 0; transition: opacity 120ms; }\nhtml[data-skin="signal"] .wz-check i { border-radius: 2px; }\n[aria-pressed="true"] .wz-check i { background: var(--accent); border-color: var(--accent); transform: scale(1.04); }\n[aria-pressed="true"] .wz-check svg { opacity: 1; }\n[aria-pressed="true"] .wz-main b { color: var(--ink-2); }\n.wz-row:disabled { opacity: .6; cursor: progress; }\n\n/* ---------- empty state ---------- */\n.wz-empty { padding: 44px 24px 24px; text-align: center; color: var(--ink-3); }\n.wz-empty .wz-tile { margin: 0 auto 14px; width: 52px; height: 52px; border-radius: 18px; font-size: 24px; color: var(--accent); }\n.wz-empty strong { display: block; margin-bottom: 4px; font-size: 16px; font-weight: 700; color: var(--ink); }\n.wz-empty p { margin: 0 auto; max-width: 30ch; font-size: 14px; line-height: 1.4; }\n\n/* ---------- composer: .ch-compose ---------- */\n.wz-compose { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 10px calc(10px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--line); }\n.wz-input { flex: 1; min-width: 0; height: 42px; padding: 0 16px; border-radius: var(--r-pill); border: 1px solid var(--line-2); outline: 0; background: var(--fill); color: var(--ink); font-size: 15px; }\n.wz-input::placeholder { color: var(--ink-3); }\n.wz-input:focus { border-color: color-mix(in srgb, var(--accent) 60%, transparent); }\n.wz-send { flex: none; width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--on-accent); transition: opacity 140ms, transform 140ms; }\nhtml[data-skin="signal"] .wz-send { border-radius: 2px; }\n.wz-send svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2.6; stroke-linecap: round; }\n.wz-send:disabled { opacity: .4; cursor: default; }\n.wz-send:not(:disabled):active { transform: scale(.94); }\n\n/* ---------- status: errors are visible, confirmations are for screen readers ---------- */\n.wz-status { flex: none; margin: 0; padding: 0 18px 6px; min-height: 0; font-size: 13px; color: var(--danger); }\n.wz-status:empty { padding: 0; }\n.wz-status.note { color: var(--ink-2); text-align: center; }\n\n/* Staging hosts label the page once; a hosted app never repeats that badge. */\nhtml.wz-hosted #wiz-staging-tag { display: none !important; }\n\n@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }\n'), 'minimal-boot.js': ('text/javascript', "/* Runs before first paint: a hosted app never flashes a standalone canvas while the shell's\n * appearance message is on its way. */\ntry { if (window.parent !== window) document.documentElement.classList.add('wz-hosted'); }\ncatch (e) { document.documentElement.classList.add('wz-hosted'); }\n"), 'layout.js': ('text/javascript', "(() => {\n const ours = new Set(['obsidian','obsidian-light','landscapes']);\n const minimal = new URL(location.href).searchParams.get('layout') === 'minimal';\n window.WizardApp?.theme.onChange(theme => {\n   const skin = theme?.skin?.id || theme?.skin || document.documentElement.dataset.skin;\n   if (!skin) return;\n   const wanted = ours.has(skin);\n   if (wanted !== minimal) { const url = new URL(location.href); if (wanted) url.searchParams.set('layout','minimal'); else url.searchParams.delete('layout'); location.replace(url.href); }\n });\n})();")}
 
 
       if __name__ == "__main__":
