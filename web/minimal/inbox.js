@@ -70,7 +70,7 @@
     busy = true; if (selected) paintDetail();
     try {
       await api('mark', {ids, ...marks});
-      if (selected && ids.includes(selected.id)) selected = {...selected, ...marks};
+      if (selected && ids.includes(selected.id)) selected = {...selected, ...marks, ...(marks.archived === true ? {read: true} : {})};
       await load();
     } catch (error) { say(error.message); }
     finally { busy = false; if (selected) paintDetail(); }
