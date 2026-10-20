@@ -30,4 +30,6 @@ class MinimalInboxTests(unittest.TestCase):
         self.assertNotIn('nav.openThread', source)
         self.assertNotIn('?session=', source)
         self.assertIn("receipt.sent !== false", source)
+        self.assertNotIn('confirm(', source)
+        self.assertIn('Confirm mark all read', source)
 if __name__ == '__main__': unittest.main()

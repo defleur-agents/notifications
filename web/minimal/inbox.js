@@ -1,9 +1,10 @@
 'use strict';
 (() => {
   const el = id => document.getElementById(id);
-  let filter = 'unread', items = [], selected = null, generation = 0, busy = false;
+  let filter = 'unread', items = [], selected = null, generation = 0, busy = false, allReadArmed = false;
   const titleOf = it => String(it.title || String(it.message || '').split('\n')[0] || 'Untitled notification');
   const say = text => { el('status').textContent = text || ''; };
+  const disarmAllRead = () => { allReadArmed = false; el('allread').textContent = 'Mark all read'; };
   function node(tag, text, cls) { const n = document.createElement(tag); if (text != null) n.textContent = String(text); if (cls) n.className = cls; return n; }
   async function api(path, data) {
     const response = await fetch('api/' + path, data ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)} : {cache: 'no-store'});
@@ -86,19 +87,22 @@
     paint(); el('scroll').scrollTop = 0; el('subject').focus();
   };
   document.querySelectorAll('[data-filter]').forEach(b => b.onclick = () => {
+    disarmAllRead();
     filter = b.dataset.filter; selected = null; el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('scroll').scrollTop = 0;
     // Clear old rows while the new filter loads, never label stale data “All”.
     items = []; paint(); load();
   });
   el('back').onclick = closeDetail;
-  el('more').onclick = () => { el('options').hidden = !el('options').hidden; el('more').setAttribute('aria-expanded', String(!el('options').hidden)); };
+  el('more').onclick = () => { disarmAllRead(); el('options').hidden = !el('options').hidden; el('more').setAttribute('aria-expanded', String(!el('options').hidden)); };
   el('refresh').onclick = load;
   el('allread').onclick = () => {
     const ids = visible().filter(it => !it.read).map(it => it.id);
-    if (ids.length && confirm('Mark the ' + ids.length + ' displayed notifications as read?')) mark(ids, {read: true});
+    if (!ids.length) return;
+    if (!allReadArmed) { allReadArmed = true; el('allread').textContent = 'Confirm mark all read'; return; }
+    allReadArmed = false; el('allread').textContent = 'Mark all read'; mark(ids, {read: true});
   };
   window.__wizardCloseOverlay = () => {
-    if (!el('options').hidden) { el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('more').focus(); return true; }
+    if (!el('options').hidden) { disarmAllRead(); el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('more').focus(); return true; }
     return closeDetail();
   };
   document.addEventListener('keydown', e => { if (e.key === 'Escape') window.__wizardCloseOverlay(); });
