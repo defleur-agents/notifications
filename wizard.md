@@ -23,6 +23,9 @@ system: true
 provides:
 - notifications
 health: /v1/health
+view:
+  path: /notifications/
+  port: 8080
 ---
 
 # Notifications
