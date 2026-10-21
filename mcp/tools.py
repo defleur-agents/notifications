@@ -187,6 +187,58 @@ def _json(code, obj):
     return code, "application/json", json.dumps(obj).encode()
 
 
+# ---- Notification pictures: MEDIA:/abs/path lines in a body show as thumbnails ----
+# Read-only, image files only, under an explicit allowlist of roots (mounted read-only at the same paths).
+# Every path is resolved with realpath first, so ../ and symlinks that leave a root are refused.
+MEDIA_ROOTS = [os.path.realpath(r) for r in os.environ.get("INBOX_MEDIA_ROOTS", "").split(":") if r.strip().startswith("/")]
+MEDIA_MAX = int(os.environ.get("INBOX_MEDIA_MAX", str(8 << 20)))
+MEDIA_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}
+
+
+def _sniff(head):
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def media_file(raw):
+    """(status, content_type, bytes) for one allowed image; never a listing, never a non-image."""
+    raw = str(raw or "")
+    if not raw.startswith("/") or len(raw) > 1000 or "\x00" in raw:
+        return _json(400, {"error": "bad path"})
+    real = os.path.realpath(raw)
+    if not any(real.startswith(root.rstrip("/") + "/") for root in MEDIA_ROOTS):
+        return _json(404, {"error": "not found"})
+    want = MEDIA_TYPES.get(os.path.splitext(real)[1].lower())
+    if not want:
+        return _json(404, {"error": "not found"})
+    try:
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return _json(404, {"error": "not found"})
+    try:
+        st = os.fstat(fd)
+        if (st.st_mode & 0o170000) != 0o100000:  # regular files only
+            return _json(404, {"error": "not found"})
+        if st.st_size > MEDIA_MAX:
+            return _json(413, {"error": "image too large"})
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(MEDIA_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(data) > MEDIA_MAX:
+        return _json(413, {"error": "image too large"})
+    if _sniff(data[:16]) != want:
+        return _json(415, {"error": "not an image"})
+    return 200, want, data
+
+
 @route(INBOX)
 def inbox_route(method, path, query, headers, body):
     sub = path[len(INBOX):] if path.startswith(INBOX) else ""
@@ -211,6 +263,9 @@ def inbox_route(method, path, query, headers, body):
             return _json(415, {"error": "send application/json"})
         d = json.loads(body or b"{}")
         return _json(200, inbox_mark(d.get("ids"), read=d.get("read"), flag=d.get("flag"), archived=d.get("archived")))
+    if method == "GET" and sub.startswith("media/"):
+        # /notifications/media/<absolute path>: the path keeps its image extension so the shell's viewer opens it.
+        return media_file("/" + urllib.parse.unquote(sub[len("media/"):]))
     if method == "GET" and sub == "healthz":
         return _json(200, {"ok": True, "view_revision": MINIMAL_REVISION})
     return _json(404, {"error": "not found"})
