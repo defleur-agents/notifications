@@ -32,4 +32,13 @@ class MinimalInboxTests(unittest.TestCase):
         self.assertIn("receipt.sent !== false", source)
         self.assertNotIn('confirm(', source)
         self.assertIn('Confirm mark all read', source)
+    def test_swipe_strip_uses_chats_numbers_and_skin_gate(self):
+        source = (ROOT/'web/minimal/inbox.js').read_text()
+        for needle in ['LOCK = 10', 'RATIO = 1.3', 'GO = 70', 'VGO = 0.45', 'MS = 240', "EASE = 'cubic-bezier(.2,.8,.2,1)'", 'EDGE = 24',
+                       "new Set(['obsidian', 'obsidian-light', 'landscapes'])", 'innerWidth < 768']:
+            self.assertIn(needle, source)
+        self.assertNotIn('setTimeout(', source.split('const strip')[1].split('window.__ntStrip')[0])
+    def test_mark_unread_never_wraps(self):
+        css = (ROOT/'web/minimal/styles.css').read_text()
+        self.assertIn('.act span { max-width: 100%; white-space: nowrap;', css)
 if __name__ == '__main__': unittest.main()

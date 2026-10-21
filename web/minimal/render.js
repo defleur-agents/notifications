@@ -65,6 +65,31 @@
     for (const b of blocks) if (b.type === 'text') for (const l of b.lines) for (const r of l) if (r.t === 'link' && r.href === href && r.text !== href) return r.text;
     return '';
   }
+  /* The primary button already opens this link, so the body's only copy goes: a line that is just the link (or
+   * "Link: <url>") is dropped, and a link that ends a sentence is cut with its lead-in colon. A link in the middle
+   * of a sentence stays (the page shows it quieted), so prose never loses words. Returns new blocks. */
+  function dropLink(blocks, href) {
+    const links = [];
+    for (const b of blocks) if (b.type === 'text') for (const l of b.lines) for (const r of l) if (r.t === 'link') links.push(r);
+    if (links.length !== 1 || links[0].href !== href) return blocks;
+    const out = [];
+    for (const b of blocks) {
+      if (b.type !== 'text') { out.push(b); continue; }
+      const lines = [];
+      for (const l of b.lines) {
+        const i = l.findIndex(r => r.t === 'link');
+        const after = l.slice(i + 1).map(r => r.text).join('');
+        if (i < 0 || !/^[\s.,;:!?)\]]*(?![\s\S])/.test(after)) { lines.push(l); continue; }
+        const runs = l.slice(0, i), prev = runs[i - 1];
+        if (prev && prev.t === 'text') runs[i - 1] = {t: 'text', text: prev.text.replace(/[\s:\u2013\u2014-]+(?![\s\S])/, '')};
+        const kept = runs.filter(r => r.t !== 'text' || r.text);
+        if (/^\s*(link|url|open|here|see|more)?\s*(?![\s\S])/i.test(kept.map(r => r.text).join(''))) continue;
+        lines.push(kept);
+      }
+      if (lines.length) out.push({type: 'text', lines});
+    }
+    return out;
+  }
   function friendlyTime(seconds, now) {
     const d = new Date(Number(seconds) * 1000); if (!seconds || Number.isNaN(d.getTime())) return '';
     const n = now ? new Date(now) : new Date();
@@ -76,5 +101,5 @@
     if (diff > 1 && diff < 7) return d.toLocaleDateString(undefined, {weekday: 'short'}) + ' ' + time;
     return d.toLocaleDateString(undefined, {day: 'numeric', month: 'short', ...(d.getFullYear() !== n.getFullYear() ? {year: 'numeric'} : {})}) + ' ' + time;
   }
-  root.NotifRender = Object.freeze({parse, inline, safeHref, firstLinkText, friendlyTime});
+  root.NotifRender = Object.freeze({parse, inline, safeHref, firstLinkText, dropLink, friendlyTime});
 })(typeof window !== 'undefined' ? window : globalThis);

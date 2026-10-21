@@ -42,4 +42,18 @@ assert.strictEqual(R.parse('MEDIA:relative.jpg', 0)[0].type, 'text');
 const now = new Date(2026, 9, 21, 12, 0).getTime();
 assert.match(R.friendlyTime(new Date(2026, 9, 21, 9, 6).getTime() / 1000, now), /^Today 9:06/);
 assert.match(R.friendlyTime(new Date(2026, 9, 20, 9, 6).getTime() / 1000, now), /^Yesterday /);
+// dropLink: the primary button's link never shows twice.
+const flat = bs => bs.filter(x => x.type === 'text').map(x => x.lines.map(l => l.map(r => r.text).join('')).join('\n')).join('\n\n');
+const mb = R.parse('Your morning report is ready: [Open Morning Report](https://h.example/?open=morning-report)', 0);
+let d = R.dropLink(mb, 'https://h.example/?open=morning-report');
+assert.strictEqual(flat(d), 'Your morning report is ready', 'sole link removed, trailing colon tidied');
+assert.ok(!d.flatMap(x => x.lines.flat()).some(r => r.t === 'link'));
+d = R.dropLink(R.parse('Done.\nLink: https://a.example/x.', 0), 'https://a.example/x');
+assert.strictEqual(flat(d), 'Done.', 'a bare "Link:" line goes with its link');
+d = R.dropLink(R.parse('See https://a.example/x for details', 0), 'https://a.example/x');
+assert.strictEqual(flat(d), 'See https://a.example/x for details', 'mid-sentence link stays (quieted by the page)');
+const two = R.parse('[A](https://a.example/) and [B](https://b.example/)', 0);
+assert.strictEqual(R.dropLink(two, 'https://a.example/'), two, 'several links: kept (the duplicate is only quieted)');
+const other = R.parse('[A](https://a.example/)', 0);
+assert.strictEqual(R.dropLink(other, 'https://z.example/'), other, 'a different link is kept');
 console.log('render tests: ok');
