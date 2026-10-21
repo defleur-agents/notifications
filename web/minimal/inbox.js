@@ -185,7 +185,7 @@
     try {
       const receipt = window.WizardApp.nav.openContextDraft({id: String(it.id), title: titleOf(it), message: String(it.message || '')});
       if (receipt?.kind !== 'unsent-draft' || receipt.sent !== false) throw new Error('Could not confirm an unsent draft.');
-      say('Draft opened in Chats. Nothing sent.');
+      say('Reply opened in Chats. Nothing sent.');
     } catch (error) { say(error.message || 'Could not open Chats.'); }
   }
   function primaryLink(it, blocks) {
@@ -206,9 +206,9 @@
     if (link) {
       const a = node('a', null, 'btn-primary'); a.href = link.href; a.target = '_blank'; a.rel = 'noopener noreferrer';
       a.append(node('span', /^open\b/i.test(link.label) ? link.label : 'Open ' + link.label)); primary.replaceChildren(a);
-    } else primary.replaceChildren(action('Start chat', 'chat', () => startChat(it), 'btn-primary'));
+    } else primary.replaceChildren(action('Reply', 'chat', () => startChat(it), 'btn-primary'));
     const acts = [];
-    if (link) acts.push(action('Start chat', 'chat', () => startChat(it)));
+    if (link) acts.push(action('Reply', 'chat', () => startChat(it)));
     acts.push(action(it.read ? 'Mark unread' : 'Mark read', it.read ? 'unread' : 'read', () => mark([it.id], {read: !it.read})));
     acts.push(action(it.flag ? 'Unflag' : 'Flag', 'flag', () => mark([it.id], {flag: !it.flag})));
     acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', () => mark([it.id], {archived: !it.archived})));
