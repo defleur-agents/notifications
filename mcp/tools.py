@@ -77,6 +77,8 @@ def notifications_recent(since="24h", limit=20):
 # The page and its API live on this front at /notifications/ (the Wizard shell opens it at the same path on its own
 # origin). ntfy keeps the messages (30 days); this keeps only the owner's marks, in a small JSON file.
 import threading
+import hashlib
+import re
 
 INBOX = "/notifications/"
 STATE_FILE = os.environ.get("INBOX_STATE", "/data/inbox.json")
@@ -115,7 +117,67 @@ def _messages(since="all"):
     return out
 
 
-def inbox_items(view="inbox", limit=200):
+def _thread_key(it):
+    """Scheduled-job runs of one job share a thread (the job name); agent notes stay one row each."""
+    if it["source"] != "cron":
+        return ""
+    return " ".join(re.sub(r"^(Failed|Recovered): ", "", it["title"] or "").split()).lower()
+
+
+def _thread_id(key):
+    return "t-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+_STAMP = re.compile(r"(\d{1,2}) (\w{3}) (\d{2}):(\d{2}) UTC\s*\Z")
+_MONTHS = "JanFebMarAprMayJunJulAugSepOctNovDec"
+
+
+def _run_time(it):
+    """When the job ran: the relay ends each result with its run stamp; the post time is the fallback (a backlog
+    relayed in one pass has one post time)."""
+    m = _STAMP.search(it["message"] or "")
+    if not m or m.group(2) not in _MONTHS or _MONTHS.index(m.group(2)) % 3:
+        return it["time"]
+    import calendar
+    y = time.gmtime(it["time"]).tm_year
+    t = calendar.timegm((y, _MONTHS.index(m.group(2)) // 3 + 1, int(m.group(1)), int(m.group(3)), int(m.group(4)), 0))
+    return calendar.timegm((y - 1,) + time.gmtime(t)[1:6]) if t > it["time"] + 86400 else t
+
+
+def _threads(items):
+    """Collapse each job's runs into one row. The row is the newest run (title, body, link) and carries every run
+    in `runs`; its id is a thread id that inbox_mark fans out to the member ids. Marks stay per run, so a new run
+    after Mark read or Archive is unread again and re-lights the row."""
+    out, groups = [], {}
+    for it in items:                                   # items arrive newest first
+        key = _thread_key(it)
+        if not key:
+            out.append(it)
+            continue
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = dict(it, id=_thread_id(key), runs=[])
+            out.append(g)
+        run = {k: it[k] for k in ("id", "time", "title", "message", "priority", "read", "flag", "archived")}
+        run["run_time"] = _run_time(it)
+        g["runs"].append(run)
+    for key, g in groups.items():
+        g["runs"].sort(key=lambda r: -r["run_time"])
+        head = next(i for i in items if i["id"] == g["runs"][0]["id"])
+        g.update({k: head[k] for k in ("time", "title", "message", "link", "tags")})
+        runs = g["runs"]
+        unread = [r for r in runs if not r["read"]]
+        g["read"] = not unread
+        g["flag"] = any(r["flag"] for r in runs)
+        g["archived"] = all(r["archived"] for r in runs)
+        g["priority"] = max([r["priority"] for r in unread] or [runs[0]["priority"]])
+        g["unread_runs"] = len(unread)
+    # A thread with an unread failure sorts first; otherwise newest first.
+    out.sort(key=lambda i: (not (not i["read"] and i["priority"] >= 4), -i["time"]))
+    return out
+
+
+def inbox_items(view="inbox", limit=200, threads=True):
     st = _load_state()
     items = []
     for m in _messages():
@@ -126,18 +188,41 @@ def inbox_items(view="inbox", limit=200):
               "source": "cron" if "cron" in tags else "agent",
               "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
         items.append(it)
-    counts = {"unread": sum(1 for i in items if not i["read"] and not i["archived"]),
-              "needs": sum(1 for i in items if not i["read"] and not i["archived"] and i["priority"] >= 4),
-              "flagged": sum(1 for i in items if i["flag"] and not i["archived"])}
+    group = _threads if threads else (lambda xs: xs)
+    # Counts come from the same rows the inbox shows (one per job thread), so badge and list never disagree.
+    live = group([i for i in items if not i["archived"]])
+    counts = {"unread": sum(1 for i in live if not i["read"]),
+              "needs": sum(1 for i in live if not i["read"] and i["priority"] >= 4),
+              "flagged": sum(1 for i in live if i["flag"])}
+    # Filter runs first, then group, so an archived thread comes back as a fresh row when a new run lands.
     if view == "flagged":
-        items = [i for i in items if i["flag"] and not i["archived"]]
+        rows = group([i for i in items if i["flag"] and not i["archived"]])
     elif view == "archive":
-        items = [i for i in items if i["archived"]]
+        rows = group([i for i in items if i["archived"]])
     elif view == "all":
-        pass
+        rows = group(items)
     else:
-        items = [i for i in items if not i["archived"]]
-    return {"view": view, "counts": counts, "items": items[:max(1, min(int(limit or 200), 500))]}
+        rows = live
+    return {"view": view, "counts": counts, "items": rows[:max(1, min(int(limit or 200), 500))]}
+
+
+def _expand_ids(ids, marks):
+    """Thread ids fan out to their runs. Mark unread on a thread re-opens only its newest run."""
+    if not any(i.startswith("t-") for i in ids):
+        return ids
+    want = {i for i in ids if i.startswith("t-")}
+    members = {}
+    for m in _messages():                              # newest first
+        tags = m.get("tags") or []
+        it = {"source": "cron" if "cron" in tags else "agent", "title": m.get("title", "")}
+        key = _thread_key(it)
+        if key and _thread_id(key) in want:
+            members.setdefault(_thread_id(key), []).append(m["id"])
+    out = [i for i in ids if not i.startswith("t-")]
+    only_newest = set(marks) == {"read"} and marks["read"] is False
+    for t, run_ids in members.items():
+        out += run_ids[:1] if only_newest else run_ids
+    return out
 
 
 def inbox_mark(ids, **marks):
@@ -145,6 +230,7 @@ def inbox_mark(ids, **marks):
     keep = {k: bool(v) for k, v in marks.items() if k in ("read", "flag", "archived") and v is not None}
     if not ids or not keep:
         raise ValueError("give ids and at least one of read, flag, archived")
+    ids = _expand_ids(ids, keep)[:2000]
     with _lock:
         st = _load_state()
         for i in ids:
@@ -171,6 +257,9 @@ def notifications_inbox(view="inbox", unread_only=False, limit=30):
     for i in items:
         i["time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(i["time"]))
         i["message"] = i["message"][:600]
+        if "runs" in i:
+            i["runs"] = [{"id": r["id"], "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["time"])),
+                          "failed": r["priority"] >= 4, "read": r["read"]} for r in i["runs"][:20]]
     return {"counts": d["counts"], "items": items}
 
 

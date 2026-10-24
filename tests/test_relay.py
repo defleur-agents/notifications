@@ -93,6 +93,24 @@ class RelayTests(unittest.TestCase):
         self.add("morning", "2026-10-25_02-00-00.md", run_md(status="error", error="model timeout"), self.t0 + 60)
         self.run_once(); self.assertEqual(self.posts[0][0], "Failed: Morning briefing")
 
+    def test_quiet_job_posts_recovered_after_a_failure(self):
+        self.add("morning", "2026-10-24_01-00-00.md", run_md(status="error", error="boom"), self.t0)
+        self.add("morning", "2026-10-24_02-00-00.md", run_md(response="Briefing sent."), self.t0 + 60)
+        self.add("morning", "2026-10-24_03-00-00.md", run_md(response="Briefing sent."), self.t0 + 120)
+        self.run_once()
+        self.assertEqual([p[0] for p in self.posts], ["Failed: Morning briefing", "Recovered: Morning briefing"])
+
+    def test_short_ok_heartbeat_is_silent(self):
+        self.add("job1", "2026-10-24_01-00-00.md", run_md(response="meter snapshot ok\n\n23 Oct 18:00 UTC"), self.t0)
+        self.add("job1", "2026-10-24_02-00-00.md", run_md(response="disk ok but 95% full"), self.t0 + 60)
+        self.run_once()
+        self.assertEqual(len(self.posts), 1)
+
+    def test_warning_sign_is_an_alert_without_failed_prefix(self):
+        self.add("job1", "2026-10-24_01-00-00.md", run_md(response="\u26a0\ufe0f VPS disk is 91% full (37G free)."), self.t0)
+        self.run_once()
+        self.assertEqual(self.posts[0][0], "Backup check"); self.assertEqual(self.posts[0][2], 4)
+
     def test_quiet_by_name(self):
         ns = load({"CRON_QUIET_JOBS": "Backup Check"})
         self.add("job1", "1.md", run_md(response="fine"), self.t0)

@@ -60,6 +60,13 @@ def cron_summarize(text):
     body = body.strip()
     if not body or body in ("[SILENT]", "SILENT"):
         return None
+    # A short all-clear heartbeat ("meter snapshot ok") is a silent run, unless the job says it failed.
+    if not failed and len(body) < 60 and re.search(r"\b(ok|healthy|nothing to report|no new activity)\b", body, re.I) and \
+            not re.search(r"\b(fail\w*|error\w*|warn\w*|full|down)\b", body, re.I):
+        return None
+    # A body that opens with a warning sign is an alert the owner needs, even when the job itself succeeded.
+    if body.startswith(("\u26a0", "\U0001f6a8")):
+        failed = True
     head = body[:240].lower()
     if re.search(r"\b(failed|failure|needs review|needs you|error|stale|not_started|action required)\b", head) and \
             not re.search(r"\b(no|0) (failures|errors)\b|all monitored checks passed", head):
@@ -137,20 +144,26 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
                 done.add(key)
                 continue
             failed, body = s
+            had_alert = job in alerts
             suppress, receipt = cron_failure_policy(job, body, failed, alerts, mt)
             if suppress:
                 skipped += 1
                 done.add(key)
                 continue
             name = names.get(job) or (re.search(r"^# Cron Job: (.+)", raw, re.M) or [0, job])[1]
+            recovered = False
             if not failed and (job.lower() in CRON_QUIET or str(name).strip().lower() in CRON_QUIET):
-                quiet_days.setdefault(fn[:10], key)
-                skipped += 1
-                done.add(key)
-                continue
+                if not had_alert:
+                    quiet_days.setdefault(fn[:10], key)
+                    skipped += 1
+                    done.add(key)
+                    continue
+                recovered = True                   # a quiet job's first success after a failure closes its thread
             when = time.strftime("%d %b %H:%M UTC", time.gmtime(mt))
+            warning = body.startswith(("\u26a0", "\U0001f6a8"))
+            prefix = "Recovered: " if recovered else "Failed: " if failed and not warning else ""
             try:
-                ok = post(("Failed: " if failed else "") + str(name), "%s\n\n%s" % (body, when),
+                ok = post(prefix + str(name), "%s\n\n%s" % (body, when),
                           4 if failed else 2, ["cron", "warning" if failed else "clock"])
             except OSError:
                 ok = False

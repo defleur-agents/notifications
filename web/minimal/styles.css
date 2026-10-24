@@ -86,3 +86,14 @@ html.nt-detail .nt-ghost .wz-scroll { padding-bottom: 8px; }
 /* Vertical scrolling stays native; a sideways drag on the detail belongs to the strip. */
 html.nt-detail .wz-app, html.nt-detail .wz-scroll { touch-action: pan-y pinch-zoom; }
 html.nt-sliding { -webkit-user-select: none; user-select: none; }
+/* One row per scheduled job: a quiet run count, and the job's earlier runs under the newest result. */
+.subject-row .runs { flex: none; min-width: 22px; padding: 1px 7px; border-radius: 99px; font-size: 12px; font-weight: 650; text-align: center; color: var(--ink-2); background: var(--fill); }
+.runs h3 { margin: 22px 0 6px; font-size: 13px; font-weight: 650; color: var(--ink-2); }
+.runs ul { list-style: none; margin: 0; padding: 0; }
+.runs li { border-top: 1px solid var(--line); }
+.runs summary { display: flex; gap: 10px; padding: 10px 2px; cursor: pointer; list-style: none; color: var(--ink-2); }
+.runs summary::-webkit-details-marker { display: none; }
+.runs summary.unread { color: var(--ink); font-weight: 650; }
+.runs .when { flex: 1; }
+.runs .state.bad { color: var(--danger, #ff8f8f); }
+.runs .run-body { margin: 0 2px 12px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); font-size: 14px; }
