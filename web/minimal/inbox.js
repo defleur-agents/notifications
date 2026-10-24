@@ -209,7 +209,11 @@
     } else primary.replaceChildren(action('Reply', 'chat', () => startChat(it), 'btn-primary'));
     const acts = [];
     if (link) acts.push(action('Reply', 'chat', () => startChat(it)));
-    acts.push(action(it.read ? 'Mark unread' : 'Mark read', it.read ? 'unread' : 'read', () => mark([it.id], {read: !it.read})));
+    // Mark unread is done with this one: back to the list, like Send in Chats returns to the session list.
+    acts.push(action(it.read ? 'Mark unread' : 'Mark read', it.read ? 'unread' : 'read', async () => {
+      const ok = await mark([it.id], {read: !it.read});
+      if (ok && it.read && selected && selected.id === it.id) closeDetail();
+    }));
     acts.push(action(it.flag ? 'Unflag' : 'Flag', 'flag', () => mark([it.id], {flag: !it.flag})));
     acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', () => mark([it.id], {archived: !it.archived})));
     if (it.flag) acts.find(b => b.textContent === 'Unflag')?.setAttribute('aria-pressed', 'true');
@@ -233,14 +237,16 @@
   }
   function paintList() { if (strip.busy()) { strip.dirty = true; return; } const keep = selected; selected = null; const top = el('scroll').scrollTop; paint(); selected = keep; el('overview').hidden = true; el('detail').hidden = false; el('toolbar').hidden = true; document.documentElement.classList.add('nt-detail'); el('scroll').scrollTop = top; }
   async function mark(ids, marks) {
-    if (busy || !ids.length) return;
+    if (busy || !ids.length) return false;
     busy = true; if (selected) paintActionsOnly();
+    let ok = false;
     try {
-      await api('mark', {ids, ...marks});
+      await api('mark', {ids, ...marks}); ok = true;
       if (selected && ids.includes(selected.id)) selected = {...selected, ...marks, ...(marks.archived === true ? {read: true} : {})};
       await load();
     } catch (error) { say(error.message); }
     finally { busy = false; if (selected) paintActionsOnly(); }
+    return ok;
   }
   function paintActionsOnly() { const top = el('scroll').scrollTop; paintDetail(); el('scroll').scrollTop = top; }
   // Back to the list where it was: same scroll position, focus on the row without scrolling it.
