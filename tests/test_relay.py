@@ -138,6 +138,33 @@ class RelayTests(unittest.TestCase):
         Path(self.state).write_text(json.dumps({"since": self.t0 - 10, "done": ["job1/1.md"], "failure_alerts": {}}))
         self.assertEqual(self.run_once()["sent"], 0)
 
+    def test_silent_run_stays_silent_after_runtime_footer(self):
+        # Real 24 Oct regression: "[SILENT]" plus the runtime's verifier footer became "Failed: ..." jargon.
+        footer = ("\u26a0\ufe0f File-mutation verifier: 1 file edit(s) FAILED this turn despite any wording above. "
+                  "Run `git status` or `read_file` to confirm what actually landed.\n  \u2022 `/x/y.json` \u2014 [write_file] Refusing")
+        self.add("job1", "1.md", run_md(response="[SILENT]\n\n" + footer), self.t0)
+        self.add("job1", "2.md", run_md(response="Backups fresh: 3 of 3.\n\n" + footer), self.t0 + 60)
+        self.run_once()
+        self.assertEqual([(p[0], p[1].split("\n")[0]) for p in self.posts], [("Backup check", "Backups fresh: 3 of 3.")])
+        self.assertNotIn("verifier", self.posts[0][1])
+
+    def test_recovery_lane_owns_failures_when_failures_off(self):
+        ns = load({"CRON_FAILURES": "off"})
+        self.add("job1", "1.md", run_md(status="error", error="Traceback (most recent call last): boom"), self.t0)
+        self.add("job1", "2.md", run_md(response="Tick 9: recovered one failed handoff."), self.t0 + 60)
+        self.add("job1", "3.md", run_md(response="\u26a0\ufe0f VPS disk is 91% full (37G free)."), self.t0 + 120)
+        self.add("job1", "4.md", run_md(response="All 3 backups fresh."), self.t0 + 180)
+        ns["cron_relay_once"](str(self.cron), self.state, self.post, time.time())
+        self.assertEqual([p[0] for p in self.posts], ["Backup check", "Backup check"])
+        self.assertTrue(self.posts[0][1].startswith("\u26a0"))
+        self.assertTrue(self.posts[1][1].startswith("All 3 backups fresh."))
+
+    def test_failures_off_from_box_local_settings_file(self):
+        (self.root / "cron-relay-settings.json").write_text(json.dumps({"failures": "off"}))
+        ns = load({"CRON_STATE": self.state})
+        self.assertFalse(ns["CRON_FAILURES"])
+        self.assertTrue(load({"CRON_STATE": str(self.root / "elsewhere" / "s.json")})["CRON_FAILURES"])
+
     def test_compose_is_generated_and_has_no_dollar_in_front(self):
         self.assertNotIn("$", (ROOT / "mcp" / "relay.py").read_text())
 
