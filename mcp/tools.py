@@ -81,9 +81,9 @@ import hashlib
 import re
 
 INBOX = "/notifications/"
-# NOTIF_LAYOUT=cards: every skin gets the card inbox (tap a row, it opens as a full card with actions);
-# empty keeps the original screen for skins outside Miguel's set.
-LAYOUT = os.environ.get("NOTIF_LAYOUT", "").strip().lower()
+# The card inbox (tap a row, it opens as a full card with actions) is the default on every skin;
+# NOTIF_LAYOUT=classic keeps the original screen for skins outside Miguel's set.
+LAYOUT = os.environ.get("NOTIF_LAYOUT", "").strip().lower() or "cards"
 STATE_FILE = os.environ.get("INBOX_STATE", "/data/inbox.json")
 TOPICS = [t for t in os.environ.get("INBOX_TOPICS", TOPIC).split(",") if t.strip()]
 _lock = threading.Lock()
