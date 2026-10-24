@@ -97,3 +97,7 @@ html.nt-sliding { -webkit-user-select: none; user-select: none; }
 .runs .when { flex: 1; }
 .runs .state.bad { color: var(--danger, #ff8f8f); }
 .runs .run-body { margin: 0 2px 12px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); font-size: 14px; }
+/* Card reading size, matching Chats: larger body text in the open card and its earlier runs. */
+#body { font-size: 17px; line-height: 1.55; }
+.runs summary { font-size: 15px; }
+.runs .run-body { font-size: 16px; line-height: 1.5; color: var(--ink); }

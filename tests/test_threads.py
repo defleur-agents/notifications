@@ -35,9 +35,13 @@ class ThreadTests(unittest.TestCase):
         self.assertIn("Note from your agent", titles)
         self.assertEqual(d["counts"], {"unread": 3, "needs": 2, "flagged": 0})   # counted per row, not per run
 
-    def test_unread_failure_sorts_first(self):
-        self.assertEqual(self.items()["items"][0]["title"], "Build delivery · flow watch")
-        self.assertGreaterEqual(self.items()["items"][0]["priority"], 4)
+    def test_order_is_newest_first_and_marking_never_moves_a_row(self):
+        before = [i["id"] for i in self.items()["items"]]
+        for i in list(before):
+            self.ns["inbox_mark"]([i], read=True)
+            self.assertEqual([r["id"] for r in self.items()["items"]], before)
+        self.ns["inbox_mark"]([before[-1]], read=False)
+        self.assertEqual([r["id"] for r in self.items()["items"]], before)
 
     def test_mark_read_fans_out_and_unread_reopens_newest(self):
         tid = next(i["id"] for i in self.items()["items"] if "flow" in i["title"])
@@ -56,7 +60,7 @@ class ThreadTests(unittest.TestCase):
         self.msgs.append(msg("a4", 400, "Failed: Build delivery · flow watch", 4))
         row = next(i for i in self.items()["items"] if "flow" in i["title"])
         self.assertEqual([r["id"] for r in row["runs"]], ["a4"])
-        self.assertFalse(row["read"]); self.assertEqual(self.items()["items"][0]["id"], row["id"])
+        self.assertFalse(row["read"]); self.assertEqual(self.items()["items"][0]["id"], row["id"])   # newest run
         self.assertEqual(len(next(i for i in self.items("archive")["items"] if "flow" in i["title"])["runs"]), 3)
 
     def test_backlog_relayed_in_one_pass_orders_by_run_stamp(self):

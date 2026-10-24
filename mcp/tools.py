@@ -81,6 +81,9 @@ import hashlib
 import re
 
 INBOX = "/notifications/"
+# NOTIF_LAYOUT=cards: every skin gets the card inbox (tap a row, it opens as a full card with actions);
+# empty keeps the original screen for skins outside Miguel's set.
+LAYOUT = os.environ.get("NOTIF_LAYOUT", "").strip().lower()
 STATE_FILE = os.environ.get("INBOX_STATE", "/data/inbox.json")
 TOPICS = [t for t in os.environ.get("INBOX_TOPICS", TOPIC).split(",") if t.strip()]
 _lock = threading.Lock()
@@ -172,8 +175,8 @@ def _threads(items):
         g["archived"] = all(r["archived"] for r in runs)
         g["priority"] = max([r["priority"] for r in unread] or [runs[0]["priority"]])
         g["unread_runs"] = len(unread)
-    # A thread with an unread failure sorts first; otherwise newest first.
-    out.sort(key=lambda i: (not (not i["read"] and i["priority"] >= 4), -i["time"]))
+    # Newest first, and nothing else: opening or marking a row never moves it (the red dot shows failures).
+    out.sort(key=lambda i: -i["time"])
     return out
 
 
@@ -333,7 +336,7 @@ def inbox_route(method, path, query, headers, body):
     sub = path[len(INBOX):] if path.startswith(INBOX) else ""
     q = urllib.parse.parse_qs(query)
     if method == "GET" and sub in ("", "index.html"):
-        html = MINIMAL_HTML if (q.get("layout") or [""])[0] == "minimal" else PAGE_HTML.replace('<script defer', '<script src="layout.js"></script><script defer')
+        html = MINIMAL_HTML if (q.get("layout") or [""])[0] == "minimal" or LAYOUT == "cards" else PAGE_HTML.replace('<script defer', '<script src="layout.js"></script><script defer')
         return 200, "text/html; charset=utf-8", html.encode()
     if method == "GET" and sub in MINIMAL_ASSETS:
         mime, content = MINIMAL_ASSETS[sub]
