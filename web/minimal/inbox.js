@@ -209,10 +209,10 @@
     } else primary.replaceChildren(action('Reply', 'chat', () => startChat(it), 'btn-primary'));
     const acts = [];
     if (link) acts.push(action('Reply', 'chat', () => startChat(it)));
-    // Mark unread is done with this one: back to the list, like Send in Chats returns to the session list.
+    // Mark read / unread is done with this one: back to the list, like Send in Chats returns to the session list.
     acts.push(action(it.read ? 'Mark unread' : 'Mark read', it.read ? 'unread' : 'read', async () => {
       const ok = await mark([it.id], {read: !it.read});
-      if (ok && it.read && selected && selected.id === it.id) closeDetail();
+      if (ok && selected && selected.id === it.id) closeDetail();
     }));
     acts.push(action(it.flag ? 'Unflag' : 'Flag', 'flag', () => mark([it.id], {flag: !it.flag})));
     acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', () => mark([it.id], {archived: !it.archived})));
