@@ -11,6 +11,11 @@ The Notifications app is the owner's own notification server on this box. What y
 
 - `notify` — send one notification. `message` is required; add a short `title`. Use `priority: high` only when it needs them soon and `urgent` only for real problems. Add a `link` (https) when there is something to open.
 - `notifications_recent` — what was sent lately (default: last 24 hours). Check it before repeating yourself.
+- `notifications_inbox` / `notifications_mark` — the owner's inbox with read, flagged and archived state; mark items only when they ask.
+
+## Scheduled jobs
+
+The app forwards the agent's scheduled-job (cron) results to the inbox by itself once its "Hermes scheduled jobs folder" setting points at the agent's cron folder (for example `/home/<user>/.hermes/cron`). Silent runs post nothing; an unchanged failure alerts once, then once a day; a changed error or a failure after a success alerts at once. Jobs named in "Jobs to keep quiet when they succeed" post only their failures. Don't `notify` again for a job result the relay already posted.
 
 ## When to notify
 
