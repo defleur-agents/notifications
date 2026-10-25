@@ -109,7 +109,7 @@ def validate_rewrite(result, payload):
     title, body = result.get("title"), result.get("body")
     if not isinstance(title, str) or not 1 <= len(title) <= 60 or not isinstance(body, str) or not 1 <= len(body) <= 650:
         raise ValueError("invalid summary length")
-    if re.search(r"[{}\n]|/[\w.-]+/|\b[a-f0-9]{12,}\b|\b(?:unit|lease|digest|gate|bytes)\b", title + " " + body, re.I) or len(re.findall(r"[.!?](?:\s|$)", body)) > 3:
+    if re.search(r"[{}\n]|/[\w.-]+/|\b[a-f0-9]{12,}\b|\b(?:unit|lease|digest|gate|bytes)\b", title + " " + body, re.I) or len(re.findall(r"[.!?](?:\s|\Z)", body)) > 3:
         raise ValueError("summary contains technical details")
     if result["verdict"] == "needs_you":
         if "What to do: " not in body or "Nothing to do." in body:
