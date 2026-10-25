@@ -107,9 +107,9 @@ def cron_failure_policy(job, body, failed, alerts, now):
 
 
 def _cron_post(title, message, priority, tags):
-    payload = {"topic": CRON_TOPIC, "title": title[:250], "message": message[:3800], "priority": priority, "tags": tags}
-    status, _ = http("POST", "/", json.dumps(payload).encode(), {"Content-Type": "application/json"}, timeout=20)
-    return status == 200
+    payload = {"topic": CRON_TOPIC, "title": title, "message": message, "priority": priority, "tags": tags}
+    rewrite_and_deliver(payload)
+    return True
 
 
 def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):

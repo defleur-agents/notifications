@@ -5,7 +5,9 @@ description: Use when the owner asks to be told when something happens or finish
 
 # Notifications
 
-The Notifications app is the owner's own notification server on this box. What you send shows up on their phone (ntfy app) and in the Notifications web app.
+The Notifications app owns a `readable` AI feature through the Connection Router. Every `notify`, cron result, and HTTP publish is rewritten before delivery. Only `needs_you` items push to the phone, at high priority, with what happened and `What to do: …`. Useful `fyi` items are saved in the web inbox only (not published to ntfy at any priority); routine no-action `noise` keeps a receipt but no inbox item. Original input is preserved under collapsed **Details**. Never post directly to the engine: it is read-only to other publishers.
+
+If the AI connection is unavailable, input is saved, a short quiet fallback appears in the inbox, and the app retries later. Explicit failures with a clear owner action may still alert; it never falls back to a raw JSON dump. The app admits model answers only after the router's validated `done` receipt. Inspect Connection Router readiness for `notifications/readable` if rewrites stay pending.
 
 ## Tools
 
@@ -15,7 +17,7 @@ The Notifications app is the owner's own notification server on this box. What y
 
 ## Scheduled jobs
 
-The app forwards the agent's scheduled-job (cron) results to the inbox by itself once its "Hermes scheduled jobs folder" setting points at the agent's cron folder (for example `/home/<user>/.hermes/cron`). Silent runs post nothing; an unchanged failure alerts once, then once a day; a changed error or a failure after a success alerts at once. Jobs named in "Jobs to keep quiet when they succeed" post only their failures. Don't `notify` again for a job result the relay already posted.
+The app reads the agent's scheduled-job results once its Hermes cron folder is configured. Silent runs, successful routine maintenance, all-clear checks and verifier footers do not push. A failed task pushes only if the rewrite identifies a concrete action for the owner; agent-owned recovery is not a human action. Existing quiet-job, unchanged-failure dedupe, recovery lanes and job grouping remain in force before rewriting. Don't `notify` again for a result the relay already processed.
 
 ## When to notify
 

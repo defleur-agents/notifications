@@ -174,6 +174,11 @@
       out.push(p);
     }
     el('body').replaceChildren(...out);
+    if (selected && selected.details) {
+      const details = node('details'), summary = node('summary', 'Details'), raw = node('pre', selected.details);
+      raw.style.whiteSpace = 'pre-wrap'; raw.style.overflowWrap = 'anywhere';
+      details.append(summary, raw); el('body').append(details);
+    }
   }
   // When the job ran: the relay ends each result with its run stamp ("23 Oct 18:00 UTC"); the post time is the fallback.
   const MONTHS = 'JanFebMarAprMayJunJulAugSepOctNovDec';

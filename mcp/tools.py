@@ -31,7 +31,7 @@ def _clean(text, limit):
       ["message"])
 def notify(message, title="", priority="default", link="", tags=""):
     _box_only()
-    body = _clean(message, 4000)
+    body = str(message or "").strip()
     if not body:
         raise ValueError("say what to tell the owner")
     payload = {"topic": TOPIC, "message": body, "priority": PRIORITIES.get(str(priority or "default"), 3)}
@@ -44,9 +44,7 @@ def notify(message, title="", priority="default", link="", tags=""):
         payload["click"] = url[:2000]
     if tags:
         payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t][:5]
-    status, raw = http("POST", "/", json.dumps(payload).encode(), {"Content-Type": "application/json"}, timeout=20)
-    sent = json.loads(raw or b"{}")
-    return {"sent": True, "id": sent.get("id"), "topic": TOPIC, "time": sent.get("time")}
+    return rewrite_and_deliver(payload)
 
 
 @tool("notifications_recent", "Read the notifications sent to the owner recently, newest last.",
@@ -116,6 +114,11 @@ def _messages(since="all"):
                 continue
             if m.get("event") == "message":
                 out.append(m)
+    quiet, details = readable_messages()
+    out.extend(quiet)
+    for item in out:
+        if item["id"] in details:
+            item["details"] = details[item["id"]]
     out.sort(key=lambda m: m.get("time", 0), reverse=True)
     return out
 
@@ -186,7 +189,7 @@ def inbox_items(view="inbox", limit=200, threads=True):
     for m in _messages():
         s = st.get(m["id"], {})
         tags = m.get("tags") or []
-        it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""),
+        it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""), "details": m.get("details", ""),
               "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
               "source": "cron" if "cron" in tags else "agent",
               "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
@@ -475,6 +478,8 @@ PAGE_JS = r"""'use strict';
     const tm = node('time', '', ago(it.time)); tm.dateTime = new Date(it.time * 1000).toISOString(); top.appendChild(tm);
     m.appendChild(top); m.appendChild(node('p', 'nt-msg', plain(it.message))); b.appendChild(m); li.appendChild(b);
     const acts = node('div', 'nt-acts');
+    // Raw input is escaped by textContent and stays collapsed until requested.
+    if (it.details && open === it.id) { const d = node('details'); const p = node('pre', '', it.details); p.style.whiteSpace = 'pre-wrap'; p.style.overflowWrap = 'anywhere'; d.append(node('summary', '', 'Details'), p); li.appendChild(d); }
     const btn = (act, label, on) => { const x = node('button', on ? 'on' : '', label); x.type = 'button'; x.dataset.act = act; acts.appendChild(x); };
     btn('flag', it.flag ? '\u2691 Flagged' : '\u2690 Flag', it.flag);
     btn('read', it.read ? 'Mark unread' : 'Mark read');
