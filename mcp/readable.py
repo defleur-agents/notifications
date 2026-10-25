@@ -128,8 +128,10 @@ def fallback_rewrite(payload):
     # A failure without an explicit owner action stays quiet. No guessed repair instructions.
     text = str(payload.get("message", ""))
     concrete = re.search(r"(?:What to do:|Needs you:)\s*([^\n]{5,240})", text, re.I)
-    clearly_failed = re.search(r"failed|cannot|unable|critical|95%|99%", text, re.I)
-    negative = re.search(r"no (?:genuine )?human|nothing (?:needed|to do)|\[SILENT\]", text, re.I)
+    if not concrete:
+        concrete = re.search(r"\b((?:Delete|Approve|Choose|Reply|Renew|Sign in|Reconnect|Free up)\b[^\n.!?]{5,200})", text, re.I)
+    clearly_failed = re.search(r"failed|cannot|unable|critical|95%|99%|offline|stopped", text, re.I)
+    negative = re.search(r"no (?:genuine )?human|nothing (?:needed|to do)|\[SILENT\]|(?:do not|don't|never) (?:delete|approve|renew|reconnect)", text, re.I)
     if concrete and clearly_failed and not negative:
         action = concrete.group(1).strip().strip("*")
         if not re.search(r"[{}]|/[\w.-]+/|\b[a-f0-9]{12,}\b|\b(?:unit|lease|digest|gate|bytes)\b", action, re.I):

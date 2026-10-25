@@ -31,6 +31,14 @@ The app reads the agent's scheduled-job results once its Hermes cron folder is c
 - Never put passwords, keys, codes or other secrets in a notification.
 - One notification per event. If nothing changed, don't send another.
 
+## Verify or repair delivery
+
+- Resolve the running front and port from container mounts and runtime metadata, not an old app checkout or assumed default port.
+- Exercise a real rewrite on an unsubscribed test topic, then read back the exact app receipt and ntfy cache. A quiet FYI must have an inbox row and no ntfy publication; minimum priority alone cannot prove no phone push.
+- Require the router's validated `done` before admitting model text. Keep a failed rewrite pending and retain its original; do not switch providers to get a test to pass.
+- Test engine authorization from empty storage: ntfy creates its auth database only after the server first starts. Provision the publishing user after that startup and deny anonymous writes throughout.
+- Preserve original cron thread keys separately from rewritten titles, or changing the copy silently splits the owner's existing job threads.
+
 ## Style
 
 Plain and short: what happened and what (if anything) they need to do. For example: title "Video ready", message "Your edit of beach.mp4 is in Files → Videos/Edited."

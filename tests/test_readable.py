@@ -81,6 +81,15 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual(self.ns["readable_messages"]()[0], [])
         self.assertEqual(self.posts, [])
 
+    def test_explicit_disk_owner_action_survives_router_outage(self):
+        def unavailable(p):
+            raise OSError("unreachable")
+        out = self.ns["rewrite_and_deliver"]({"message": "The disk is 95% full. Delete old downloaded videos or approve extra storage."}, rewrite=unavailable)
+        self.assertTrue(out["pending"])
+        self.assertTrue(out["pushed"])
+        self.assertEqual(out["verdict"], "needs_you")
+        self.assertIn("Delete old downloaded videos or approve extra storage", out["body"])
+
     def test_missing_done_or_error_discards_provisional_text(self):
         for s in ['data: {"type":"delta","text":"unsafe"}\n\n', 'data: {"type":"error","code":"needs_owner"}\n\n']:
             with self.assertRaises((ValueError, RuntimeError)):
