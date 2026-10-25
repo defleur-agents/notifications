@@ -93,17 +93,23 @@ def router_rewrite(payload):
         text, receipt = read_router_stream(response)
     text = text.strip()
     if text.startswith("```"):
-        text = re.sub(r"\A```(?:json)?\s*|\s*```\Z", "", text)
-    return json.loads(text), receipt
+        fenced = re.match(r"\A```(?:json)?\s*(.*?)\s*```", text, re.S)
+        if not fenced:
+            raise ValueError("incomplete structured response")
+        text = fenced.group(1)
+    return text, receipt
 
 
 def validate_rewrite(result, payload):
     if not isinstance(result, dict) or result.get("verdict") not in ("needs_you", "fyi", "noise"):
         raise ValueError("invalid verdict")
+    if result["verdict"] == "noise" or str(payload.get("message", "")).strip().startswith("[SILENT]") or re.search(r"no (?:genuine )?human gate|nothing needed action", str(payload.get("message", "")), re.I):
+        # Noise is a receipt, not copy to deliver. Models sometimes return an empty body for [SILENT].
+        result = {"verdict": "noise", "title": "Background update", "body": "There is no update that needs your attention. Nothing to do."}
     title, body = result.get("title"), result.get("body")
     if not isinstance(title, str) or not 1 <= len(title) <= 60 or not isinstance(body, str) or not 1 <= len(body) <= 650:
         raise ValueError("invalid summary length")
-    if re.search(r"[{}\n]|/[\w.-]+/|\b[a-f0-9]{12,}\b|\b(?:unit|lease|digest|gate|bytes)\b", title + " " + body, re.I):
+    if re.search(r"[{}\n]|/[\w.-]+/|\b[a-f0-9]{12,}\b|\b(?:unit|lease|digest|gate|bytes)\b", title + " " + body, re.I) or len(re.findall(r"[.!?](?:\s|$)", body)) > 3:
         raise ValueError("summary contains technical details")
     if result["verdict"] == "needs_you":
         if "What to do: " not in body or "Nothing to do." in body:
@@ -163,10 +169,12 @@ def _rewrite_and_deliver(payload, uid=None, rewrite=None):
     pending, receipt = 0, {}
     try:
         result, receipt = (rewrite or router_rewrite)(payload)
+        if isinstance(result, str):
+            result = json.loads(result)
         result = validate_rewrite(result, payload)
     except Exception as error:
         result = fallback_rewrite(payload)
-        receipt = {"error": type(error).__name__, "reason": str(error)[:160]}
+        receipt = {**receipt, "error": type(error).__name__, "reason": str(error)[:160]}
         pending = 1
     # Persist classification first: an ntfy outage never loses the original input.
     with _READABLE_LOCK, readable_db() as db:
@@ -235,6 +243,19 @@ def publish_route(method, path, query, headers, body):
         return _json(200, rewrite_and_deliver(payload))
     except (ValueError, UnicodeError):
         return _json(400, {"error": "send text or a JSON message"})
+
+
+def readable_health(method, path, query, headers, body):
+    if method != "GET":
+        return _json(405, {"error": "read only"})
+    names = {thread.name for thread in threading.enumerate() if thread.is_alive()}
+    with readable_db() as db:
+        pending = db.execute("SELECT COUNT(*) FROM updates WHERE pending=1").fetchone()[0]
+    return _json(200, {"healthy": True, "rewrite_retry_running": "notification-rewrite-retry" in names,
+                       "cron_relay_running": "cron-relay" in names, "pending": pending})
+
+
+ROUTES["/v1/readable/health"] = readable_health
 
 
 if __name__ == "__main__":

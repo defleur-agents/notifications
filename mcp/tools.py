@@ -21,8 +21,7 @@ def _clean(text, limit):
     return text[:limit]
 
 
-@tool("notify", "Send the owner a notification on their phone and in the Notifications app. Use it for things "
-      "they asked to be told about, finished long jobs, or problems that need them. Keep it short and plain.",
+@tool("notify", "Send an update through the app's AI editor. Only concrete owner actions push; useful FYI stays in the inbox and routine noise is suppressed. Original details are retained.",
       {"message": {"type": "string", "description": "What happened, in one or two sentences"},
        "title": {"type": "string", "description": "Short title, e.g. 'Video ready' (optional)"},
        "priority": {"type": "string", "enum": list(PRIORITIES), "description": "default unless it is urgent"},
@@ -114,11 +113,19 @@ def _messages(since="all"):
                 continue
             if m.get("event") == "message":
                 out.append(m)
+    details, thread_titles = {}, {}
     quiet, details = readable_messages()
+    with readable_db() as db:
+        for row in db.execute("SELECT raw,sent FROM updates WHERE sent != ''"):
+            sent, raw = json.loads(row["sent"]), json.loads(row["raw"])
+            if "cron" in (raw.get("tags") or []):
+                thread_titles[sent["id"]] = raw.get("title", "")
     out.extend(quiet)
     for item in out:
         if item["id"] in details:
             item["details"] = details[item["id"]]
+        if item["id"] in thread_titles:
+            item["thread_title"] = thread_titles[item["id"]]
     out.sort(key=lambda m: m.get("time", 0), reverse=True)
     return out
 
@@ -127,7 +134,7 @@ def _thread_key(it):
     """Scheduled-job runs of one job share a thread (the job name); agent notes stay one row each."""
     if it["source"] != "cron":
         return ""
-    return " ".join(re.sub(r"^(Failed|Recovered): ", "", it["title"] or "").split()).lower()
+    return " ".join(re.sub(r"^(Failed|Recovered): ", "", it.get("thread_title", it["title"]) or "").split()).lower()
 
 
 def _thread_id(key):
@@ -189,7 +196,7 @@ def inbox_items(view="inbox", limit=200, threads=True):
     for m in _messages():
         s = st.get(m["id"], {})
         tags = m.get("tags") or []
-        it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""), "details": m.get("details", ""),
+        it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""), "details": m.get("details", ""), "thread_title": m.get("thread_title", m.get("title", "")),
               "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
               "source": "cron" if "cron" in tags else "agent",
               "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
@@ -220,7 +227,7 @@ def _expand_ids(ids, marks):
     members = {}
     for m in _messages():                              # newest first
         tags = m.get("tags") or []
-        it = {"source": "cron" if "cron" in tags else "agent", "title": m.get("title", "")}
+        it = {"source": "cron" if "cron" in tags else "agent", "title": m.get("title", ""), "thread_title": m.get("thread_title", m.get("title", ""))}
         key = _thread_key(it)
         if key and _thread_id(key) in want:
             members.setdefault(_thread_id(key), []).append(m["id"])

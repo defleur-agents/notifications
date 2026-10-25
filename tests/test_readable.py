@@ -96,6 +96,16 @@ class RewriteTests(unittest.TestCase):
             self.assertFalse(out["pushed"])
             self.assertTrue(out["pending"])
 
+    def test_noise_empty_body_is_a_receipt_not_an_invalid_alert(self):
+        out = self.ns["rewrite_and_deliver"]({"message": "No genuine human gate."}, rewrite=lambda p: ({"verdict": "noise", "title": "[SILENT]", "body": ""}, DONE))
+        self.assertEqual(out["verdict"], "noise")
+        self.assertFalse(out["pending"])
+        self.assertFalse(out["pushed"])
+
+    def test_rewritten_cron_keeps_original_thread_key(self):
+        self.assertEqual(self.ns["_thread_key"]({"source":"cron", "title":"A new readable title", "thread_title":"Recovered: Backup"}), "backup")
+        self.assertEqual(self.ns["_thread_key"]({"source":"cron", "title":"Backup"}), "backup")
+
     def test_http_json_and_topic_publish_use_same_boundary(self):
         called = []
         self.ns["rewrite_and_deliver"] = lambda p: called.append(p) or {"pushed": False}
