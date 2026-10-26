@@ -102,17 +102,56 @@ def _save_state(d):
     os.replace(tmp, STATE_FILE)
 
 
+# ntfy charges every message a poll replays from its cache against the visitor's daily bandwidth budget
+# (500 MB by default, the same budget attachments use; the request-limit exemption does not cover it). The
+# inbox reads both topics on every list, count and mark, so re-reading "since=all" each time used the whole
+# budget in a day and the page showed "HTTP Error 429: Too Many Requests". Each topic is read in full once
+# every POLL_FULL_EVERY seconds (that also drops messages ntfy has expired); in between only messages newer
+# than the last one seen are fetched. If the engine refuses, the last good copy is shown instead of an error.
+POLL_FULL_EVERY = int(os.environ.get("INBOX_POLL_FULL_EVERY", "600"))
+_poll_cache = {}
+_poll_lock = threading.Lock()
+
+
+def _poll(topic, since):
+    status, raw = http("GET", "/%s/json?poll=1&since=%s" % (urllib.parse.quote(topic.strip()), since), timeout=20)
+    out = []
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if m.get("error") and not m.get("event"):    # ntfy can report a limit inside a 200 stream
+            raise RuntimeError("notification server: %s" % m.get("error"))
+        if m.get("event") == "message":
+            out.append(m)
+    return out
+
+
+def _topic_messages(topic, now=None):
+    now = time.time() if now is None else now
+    with _poll_lock:
+        c = _poll_cache.get(topic)
+        try:
+            if c is None or now - c["full_at"] >= POLL_FULL_EVERY:
+                c = {"msgs": _poll(topic, "all"), "full_at": now}
+            elif c["msgs"]:
+                seen = {m["id"] for m in c["msgs"]}
+                c["msgs"] += [m for m in _poll(topic, str(int(c["msgs"][-1].get("time", 0)))) if m["id"] not in seen]
+            else:
+                c["msgs"] = _poll(topic, "all")
+            _poll_cache[topic] = c
+        except Exception as e:
+            if c is None:
+                raise
+            print("inbox poll %s: %s: %s (showing the last good copy)" % (topic, type(e).__name__, e), flush=True)
+        return [dict(m) for m in c["msgs"]]
+
+
 def _messages(since="all"):
     out = []
     for t in TOPICS:
-        status, raw = http("GET", "/%s/json?poll=1&since=%s" % (urllib.parse.quote(t.strip()), since), timeout=20)
-        for line in raw.decode("utf-8", "replace").splitlines():
-            try:
-                m = json.loads(line)
-            except ValueError:
-                continue
-            if m.get("event") == "message":
-                out.append(m)
+        out.extend(_topic_messages(t))
     details, thread_titles = {}, {}
     quiet, details = readable_messages()
     with readable_db() as db:
