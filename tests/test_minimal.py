@@ -46,4 +46,17 @@ class MinimalInboxTests(unittest.TestCase):
     def test_mark_unread_never_wraps(self):
         css = (ROOT/'web/minimal/styles.css').read_text()
         self.assertIn('.act span { max-width: 100%; white-space: nowrap;', css)
+    def test_selected_filter_label_is_readable_on_every_skin(self):
+        # James, 28 Oct 2026: on Nebula the selected "Unread" pill was a blank white box. The glass skins set
+        # --nt-page to transparent, so a label coloured with it vanishes; it must use an opaque skin colour.
+        import re
+        css = (ROOT/'web/minimal/styles.css').read_text()
+        rules = re.findall(r'\.nt-filters button\[aria-pressed="true"\][^{]*\{([^}]*)\}', css)
+        self.assertTrue(rules)
+        for body in rules:
+            color = re.search(r'(?<![-\w])color:\s*([^;]+);', body)
+            self.assertIsNotNone(color)
+            self.assertNotIn('--nt-page', color.group(1))
+            self.assertNotIn('transparent', color.group(1))
+
 if __name__ == '__main__': unittest.main()
