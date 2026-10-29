@@ -135,8 +135,44 @@ def fallback_rewrite(payload):
     if concrete and clearly_failed and not negative:
         action = concrete.group(1).strip().strip("*")
         if not re.search(r"[{}]|/[\w.-]+/|\b[a-f0-9]{12,}\b|\b(?:unit|lease|digest|gate|bytes)\b", action, re.I):
-            return {"verdict": "needs_you", "title": "An update needs your attention", "body": "An automatic task needs help. What to do: " + action}
-    return {"verdict": "fyi", "title": "Update saved", "body": "An app sent an update. Open it for details. Nothing to do."}
+            return {"verdict": "needs_you", "title": fallback_title(payload, "An update needs your attention"), "body": (fallback_excerpt(text, 1) + " What to do: " + action).strip()}
+    excerpt = fallback_excerpt(text, 2)
+    return {"verdict": "fyi", "title": fallback_title(payload, "Update saved"), "body": (excerpt + " Nothing to do.").strip()}
+
+
+def _plain(text):
+    # The fallback must still be readable: keep the sender's words, drop markup, ids and paths.
+    text = re.sub(r"File-mutation verifier:[\s\S]*", "", text)
+    text = re.sub(r"`([^`\n]*)`", r"\1", text)
+    text = re.sub(r"^\s*#+\s*[^\n]*\n", "", text, flags=re.M)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"https?://\S+|(?:~|\.)?/[\w.@-]+(?:/[\w.@-]+)+/?|\b\w+:[a-f0-9]{8,}\b|\b[a-f0-9]{12,}\b", "", text)
+    text = re.sub(r"[*_>#|{}\[\]]", "", text)
+    text = re.sub(r"^\s*[-\u2022]\s*", "", text, flags=re.M)
+    return re.sub(r"\s+", " ", text).strip(" .:;,-")
+
+
+def fallback_title(payload, default):
+    title = _plain(str(payload.get("title", "")))
+    if not title:
+        return default
+    return title if len(title) <= 60 else title[:57].rsplit(" ", 1)[0] + "..."
+
+
+def fallback_excerpt(text, sentences):
+    if text.lstrip()[:1] in "{[":
+        return ""  # structured job output is never shown raw
+    plain = re.sub(r"\s+([.,;:!?])", r"\1", _plain(text))
+    if not plain:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", plain)
+    out = " ".join(parts[:sentences]).strip()
+    if len(out) > 320:
+        out = out[:317].rsplit(" ", 1)[0] + "..."
+    if out and out[-1] not in ".!?":
+        out += "."
+    return out[0].upper() + out[1:]
+
 
 
 def _deliver_readable(uid, payload, result):

@@ -34,6 +34,21 @@ class RewriteTests(unittest.TestCase):
         return self.ns["rewrite_and_deliver"]({"title": title, "message": message, "topic": "test"},
             rewrite=lambda p: ({"verdict": verdict, "title": "Task update", "body": body}, DONE))
 
+    def test_fallback_shows_the_update_itself(self):
+        # A router outage must not hide what the update says behind a placeholder.
+        fb = self.ns["fallback_rewrite"]
+        out = fb({"title": "Memory Steward \u00b7 nightly", "message": "self-repair started: budget-20261028\n\n28 Oct 23:46 UTC"})
+        self.assertEqual(out["verdict"], "fyi")
+        self.assertEqual(out["title"], "Memory Steward \u00b7 nightly")
+        self.assertIn("Self-repair started", out["body"])
+        self.assertNotIn("Open it for details", out["body"])
+        self.assertTrue(out["body"].endswith("Nothing to do."))
+        out = fb({"title": "Thales offline", "message": "Ping `100.1.2.3` failed at /home/x/y.log for cron:32b18d6c491e. **The Mac** is not reachable. Third sentence here."})
+        self.assertNotRegex(out["body"], r"[`*]|/home|32b18d6c491e")
+        self.assertIn("The Mac is not reachable.", out["body"])
+        self.assertNotIn("Third sentence", out["body"])
+        self.assertEqual(fb({"message": "x"})["title"], "Update saved")
+
     def test_exact_cleanup_input_is_not_pushed(self):
         fixture = os.environ.get("NIGHTLY_CLEANUP_FIXTURE")
         raw = Path(fixture).read_text() if fixture else json.dumps({"apply": True, "selected": [{"path": "/owner/releases/old", "reason": "old-unreferenced-release"}] * 9, "removed": ["/owner/releases/old"] * 9, "errors": [], "used_percent": 88.4})
