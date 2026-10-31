@@ -124,5 +124,24 @@ class RelayTests(unittest.TestCase):
         self.assertNotIn("$", (ROOT / "mcp" / "relay.py").read_text())
 
 
+class FailureRoutingSetting(unittest.TestCase):
+    """James 31 Oct 2026: alerts go through the agent first; an app update must not turn raw failures back on."""
+
+    def setting(self, env, file_value=None):
+        with tempfile.TemporaryDirectory() as d:
+            if file_value is not None:
+                Path(d, "cron-relay-settings.json").write_text(json.dumps({"failures": file_value}))
+            return load(dict(env, CRON_STATE=os.path.join(d, "cron-relay.json")))["CRON_FAILURES"]
+
+    def test_upstream_auto_default_does_not_override_box_off(self):
+        self.assertFalse(self.setting({"CRON_FAILURES": "auto"}, "off"))
+        self.assertFalse(self.setting({}, "off"))
+
+    def test_explicit_values(self):
+        self.assertFalse(self.setting({"CRON_FAILURES": "agent"}))
+        self.assertTrue(self.setting({"CRON_FAILURES": "owner"}, "off"))
+        self.assertTrue(self.setting({"CRON_FAILURES": "auto"}))
+
+
 if __name__ == "__main__":
     unittest.main()

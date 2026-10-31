@@ -26,15 +26,21 @@ CRON_STATE = os.environ.get("CRON_STATE", os.path.join(os.path.dirname(STATE_FIL
 
 
 def _failures_setting():
-    """CRON_FAILURES from the app form, else a box-local /data/cron-relay-settings.json {"failures": "off"}."""
-    v = os.environ.get("CRON_FAILURES", "")
-    if not v.strip():
+    """True when failed runs post to the owner.
+
+    The box-local /data/cron-relay-settings.json {"failures": "off"} wins over the app form's default:
+    upstream compose ships CRON_FAILURES=auto, and on 31 Oct 2026 that default silently re-enabled
+    failure posts on a box whose agent-side recovery lane owns them (James: alerts go through the
+    agent first). Explicit form values still apply: owner/on posts, agent/off does not.
+    """
+    v = os.environ.get("CRON_FAILURES", "").strip().lower()
+    if v in ("", "auto", "default"):
         try:
             with open(os.path.join(os.path.dirname(CRON_STATE), "cron-relay-settings.json")) as f:
-                v = str(json.load(f).get("failures", ""))
+                v = str(json.load(f).get("failures", "")).strip().lower() or v
         except (OSError, ValueError, AttributeError):
-            v = ""
-    return v.strip().lower() not in ("off", "0", "false", "no")
+            pass
+    return v not in ("off", "0", "false", "no", "agent")
 
 
 CRON_FAILURES = _failures_setting()
