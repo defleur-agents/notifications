@@ -5,7 +5,9 @@
 services:
   notifications:
     image: python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
-    user: 1000:1000
+    # Rootless Docker boxes whose agent folders are owner-only (0700) set NOTIFICATIONS_USER=0:0 (container root
+    # is the box owner there, with no capabilities).
+    user: ${NOTIFICATIONS_USER:-1000:1000}
     read_only: true
     cap_drop:
     - ALL
@@ -15,7 +17,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: notifications
-      APP_VERSION: 2.29.0-wizard13
+      APP_VERSION: 2.29.0-wizard15
       FRONT_PORT: '8080'
       UPSTREAM_HOST: notifications-engine
       UPSTREAM_PORT: '8080'
@@ -31,9 +33,16 @@ services:
       # Failures go to the agent's 'Failure responder' cron job when one exists (auto); owner = always post.
       CRON_FAILURES: ${CRON_FAILURES:-auto}
       CRON_ESCALATE_H: ${CRON_ESCALATE_H:-24}
+      # Thumbnails: up to four host folders whose images notifications may show (MEDIA:<path> lines), each
+      # mounted read-only at its own path. Unset = none.
+      INBOX_MEDIA_ROOTS: ${INBOX_MEDIA_1:-}:${INBOX_MEDIA_2:-}:${INBOX_MEDIA_3:-}:${INBOX_MEDIA_4:-}
     volumes:
     - ${APP_DATA_DIR}/inbox:/data
     - ${HERMES_CRON_DIR:-${APP_DATA_DIR}/no-hermes-cron}:/hermes-cron:ro
+    - ${INBOX_MEDIA_1:-${APP_DATA_DIR}/no-media-1}:${INBOX_MEDIA_1:-/no-media-1}:ro
+    - ${INBOX_MEDIA_2:-${APP_DATA_DIR}/no-media-2}:${INBOX_MEDIA_2:-/no-media-2}:ro
+    - ${INBOX_MEDIA_3:-${APP_DATA_DIR}/no-media-3}:${INBOX_MEDIA_3:-/no-media-3}:ro
+    - ${INBOX_MEDIA_4:-${APP_DATA_DIR}/no-media-4}:${INBOX_MEDIA_4:-/no-media-4}:ro
     depends_on:
     - notifications-engine
     command:
@@ -1126,6 +1135,9 @@ services:
       NTFY_CACHE_DURATION: 720h
       # Polls replay the cache and count toward this; the inbox re-reads it often, and 500M/day ran out.
       NTFY_VISITOR_ATTACHMENT_DAILY_BANDWIDTH_LIMIT: 100G
+      # Every inbox/count request reaches ntfy from the one front container; exempt box/private addresses from
+      # ntfy's per-visitor request limit so the bell and open windows never get 429.
+      NTFY_VISITOR_REQUEST_LIMIT_EXEMPT_HOSTS: ${NTFY_EXEMPT_HOSTS:-127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       NTFY_ATTACHMENT_CACHE_DIR: /var/lib/ntfy/attachments
       NTFY_UPSTREAM_BASE_URL: ${NTFY_UPSTREAM_BASE_URL:-}
       NTFY_ENABLE_LOGIN: 'false'
