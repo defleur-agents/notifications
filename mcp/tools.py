@@ -291,6 +291,7 @@ SYSTEM_KINDS = {
 }
 ROUTE_DEFAULTS = {"notifications": "chats", **{"system:" + k: "daily" for k in SYSTEM_KINDS}}
 ROUTES_MAX = 300
+ROUTE_HOOKS = []   # fn(changes) after a saved change (the phone router takes an app's notifications away)
 # What a source is called (the Morning Report's Overnight lines use these, so its picker knows which line is which).
 ROUTE_NAMES = {"notifications": "Notifications", **{"system:" + k: v[0] for k, v in SYSTEM_KINDS.items()}}
 
@@ -382,6 +383,11 @@ def set_inbox_routes(changes):
             except OSError:
                 pass
             raise
+    for hook in ROUTE_HOOKS:
+        try:
+            hook(changes)
+        except Exception as e:   # the choice is saved; a hook never undoes it
+            print("route hook error: %s: %s" % (type(e).__name__, e), flush=True)
     return {"ok": True, "routes": cur, "defaults": dict(ROUTE_DEFAULTS), "saved": True}
 
 
