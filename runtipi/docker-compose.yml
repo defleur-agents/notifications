@@ -17,7 +17,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: notifications
-      APP_VERSION: 2.29.0-wizard19
+      APP_VERSION: 2.29.0-wizard20
       FRONT_PORT: '8080'
       UPSTREAM_HOST: notifications-engine
       UPSTREAM_PORT: '8080'
@@ -603,23 +603,43 @@ services:
       ROUTE_NAMES = {"notifications": "Notifications", **{"system:" + k: v[0] for k, v in SYSTEM_KINDS.items()}}
 
 
+      # Morning Report sections (format wizard.report-section/1): "report:<section id>", e.g. report:wizard-health or
+      # report:wizard-calendar.today. A section lives in the Morning report (default) or is Off; Chats and Badge are refused
+      # until an app can send its section on its own, so a section is never lost between places.
+      REPORT_TO = ("daily", "off")
+      REPORT_ROUTES = {"prefix": "report:", "default": "daily", "allowed": list(REPORT_TO)}
+
+
+      def _report_id(i):
+          import re
+          return isinstance(i, str) and bool(re.fullmatch(r"report:[a-z0-9][a-z0-9-]{0,47}(\.[a-z0-9][a-z0-9-]{0,31})?", i))
+
+
       def _route_id(i):
           if not isinstance(i, str):
               return False
           if i.startswith("system:"):
               return i[7:] in SYSTEM_KINDS
+          if i.startswith("report:"):
+              return _report_id(i)
           return _source_app(i)
 
 
       def _daily_ok(i):
-          return i == "notifications" or i.startswith("system:")
+          return i == "notifications" or i.startswith("system:") or _report_id(i)
+
+
+      def _route_ok(k, v):
+          if v not in ROUTE_TO or (v == "daily" and not _daily_ok(k)):
+              return False
+          return v in REPORT_TO if k.startswith("report:") else True
 
 
       def _clean_routes(d):
           out = {}
           if isinstance(d, dict):
               for k, v in d.items():
-                  if _route_id(k) and v in ROUTE_TO and (v != "daily" or _daily_ok(k)):
+                  if _route_id(k) and _route_ok(k, v):
                       out[k] = v
                   if len(out) >= ROUTES_MAX:
                       break
@@ -633,7 +653,7 @@ services:
           except (OSError, ValueError):
               d = {}
           saved = _clean_routes(d.get("routes") if isinstance(d, dict) else None)
-          return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "names": ROUTE_NAMES,
+          return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "names": ROUTE_NAMES, "report": REPORT_ROUTES,
                   "saved": bool(saved) or bool(isinstance(d, dict) and d.get("saved"))}
 
 
@@ -648,6 +668,8 @@ services:
                   raise ValueError("route must be chats, badge, daily or off")
               if v == "daily" and not _daily_ok(k):
                   raise ValueError("%s can't wait for the morning report" % k)
+              if k.startswith("report:") and v not in REPORT_TO:
+                  raise ValueError("a report section is in the Morning report or Off")
           with _lock:
               cur = inbox_routes()["routes"]
               cur.update(changes)

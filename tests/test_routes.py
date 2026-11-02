@@ -65,6 +65,23 @@ class RouteTests(unittest.TestCase):
         code, _ = self.call("POST", "api/routes", {"routes": {"notifications": "daily"}})
         self.assertEqual(code, 200, "Notifications' own alerts can be Daily")
 
+    def test_report_sections_are_daily_or_off(self):
+        """Morning Report sections (report:<id>) default to the report; Off drops them; Chats/Badge are refused for now."""
+        code, d = self.call("GET", "api/routes")
+        self.assertEqual(d["report"], {"prefix": "report:", "default": "daily", "allowed": ["daily", "off"]})
+        code, d = self.call("POST", "api/routes", {"routes": {"report:wizard-health": "off", "report:wizard-calendar.today": "daily"}})
+        self.assertEqual(code, 200)
+        self.assertEqual(d["routes"], {"report:wizard-health": "off", "report:wizard-calendar.today": "daily"})
+        for bad in ({"report:wizard-health": "chats"}, {"report:wizard-health": "badge"}, {"report:Bad": "off"},
+                    {"report:": "off"}, {"report:a.b.c": "off"}, {"report:x/y": "off"}):
+            code, _ = self.call("POST", "api/routes", {"routes": bad})
+            self.assertEqual(code, 400, bad)
+        again = load(self.ns["STATE_FILE"])["inbox_routes"]()
+        self.assertEqual(again["routes"]["report:wizard-health"], "off")
+        # a hand-edited routes.json with a Chats report section is cleaned on read
+        Path(self.ns["ROUTES_FILE"]).write_text(json.dumps({"routes": {"report:wizard-health": "chats", "messenger": "badge"}, "saved": True}))
+        self.assertEqual(self.ns["inbox_routes"]()["routes"], {"messenger": "badge"})
+
     def test_daily_rolls_up_last_day_and_never_a_problem(self):
         real = self.ns["time"].time
         self.ns["time"].time = lambda: NOW
