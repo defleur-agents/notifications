@@ -25,6 +25,7 @@ MAX_HEAD = 65536
 MAX_BODY = 1 << 20
 TOOLS = {}
 ROUTES = {}  # path prefix -> fn(method, path, query, headers, body) -> (status, content_type, bytes); app pages and APIs
+STREAMS = {}  # exact path -> async fn(reader, writer, method, target, rest): a response that stays open (event streams)
 REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
 
 
@@ -43,12 +44,21 @@ def route(prefix):
     return deco
 
 
+def stream(path):
+    def deco(fn):
+        STREAMS[path] = fn
+        return fn
+    return deco
+
+
 async def serve_route(reader, writer, fn, method, target, rest):
     headers = {}
     for line in rest.decode("latin-1").split("\r\n"):
         if ":" in line:
             k, v = line.split(":", 1)
             headers[k.strip().lower()] = v.strip()
+    # The caller's address, under a key no request header can produce (header names never start with ':').
+    headers[":peer"] = (writer.get_extra_info("peername") or ("",))[0]
     n = int(headers.get("content-length") or 0)
     if n > MAX_BODY:
         return await respond(writer, 413, {"error": "request too large"})
@@ -222,7 +232,9 @@ async def handle(reader, writer):
     line, _, rest = head.partition(b"\r\n")
     parts = line.decode("latin-1").split(" ")
     path = parts[1].split("?", 1)[0] if len(parts) >= 3 else ""
-    for prefix, fn in ROUTES.items():
+    if path in STREAMS:
+        return await STREAMS[path](reader, writer, parts[0], parts[1], rest)
+    for prefix, fn in sorted(ROUTES.items(), key=lambda r: -len(r[0])):   # the most specific prefix wins
         if path == prefix.rstrip("/") or path.startswith(prefix):
             return await serve_route(reader, writer, fn, parts[0], parts[1], rest)
     if cross_site(parts[0], path, parse_headers(rest)):
