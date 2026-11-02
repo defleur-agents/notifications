@@ -277,6 +277,137 @@ def set_inbox_source(app, chats=None, phone=None):
     return {"ok": True, "sources": cur}
 
 
+# ---- Routes: where each source's notifications go, ONE place each (Miguel, 2 Nov 2026) ----
+# Chats (a thread that waits), Badge (a count on its icon), Daily (one line in tomorrow's Morning Report) or Off (only
+# this app's history). Stored on the box, so every device shows the same choice. Sources: an app id, "notifications"
+# (the agent's own alerts) or "system:<kind>" for notices about Wizard itself. Daily is for Notifications and System
+# only: an app's own items (Mail, Messenger) would lose their point if they waited a day.
+ROUTES_FILE = os.environ.get("INBOX_ROUTES", os.path.join(os.path.dirname(STATE_FILE) or ".", "routes.json"))
+ROUTE_TO = ("chats", "badge", "daily", "off")
+SYSTEM_KINDS = {
+    "app-updates": ("App updates", r"(\d+ apps? updated|App updates need a look)"),
+    "connections": ("App connections", r"(App connection added|Connection needs your OK)"),
+    "wizard-updates": ("Wizard updates", r"(App Manager updated|Wizard OS updated|Your release needs you to finish an update)"),
+}
+ROUTE_DEFAULTS = {"notifications": "chats", **{"system:" + k: "daily" for k in SYSTEM_KINDS}}
+ROUTES_MAX = 300
+
+
+def _route_id(i):
+    if not isinstance(i, str):
+        return False
+    if i.startswith("system:"):
+        return i[7:] in SYSTEM_KINDS
+    return _source_app(i)
+
+
+def _daily_ok(i):
+    return i == "notifications" or i.startswith("system:")
+
+
+def _clean_routes(d):
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if _route_id(k) and v in ROUTE_TO and (v != "daily" or _daily_ok(k)):
+                out[k] = v
+            if len(out) >= ROUTES_MAX:
+                break
+    return out
+
+
+def inbox_routes():
+    try:
+        with open(ROUTES_FILE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    saved = _clean_routes(d.get("routes") if isinstance(d, dict) else None)
+    return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "saved": bool(saved) or bool(isinstance(d, dict) and d.get("saved"))}
+
+
+def set_inbox_routes(changes):
+    """changes: {source id: chats|badge|daily|off}. Unknown ids, values or a Daily an app can't take are refused."""
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("give routes as {source: chats|badge|daily|off}")
+    for k, v in changes.items():
+        if not _route_id(k):
+            raise ValueError("unknown source: %s" % str(k)[:70])
+        if v not in ROUTE_TO:
+            raise ValueError("route must be chats, badge, daily or off")
+        if v == "daily" and not _daily_ok(k):
+            raise ValueError("%s can't wait for the morning report" % k)
+    with _lock:
+        cur = inbox_routes()["routes"]
+        cur.update(changes)
+        if len(cur) > ROUTES_MAX:
+            raise ValueError("too many sources")
+        folder = os.path.dirname(ROUTES_FILE) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".routes-", suffix=".tmp", dir=folder)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"routes": cur, "saved": True}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o666)
+            os.replace(tmp, ROUTES_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    return {"ok": True, "routes": cur, "defaults": dict(ROUTE_DEFAULTS), "saved": True}
+
+
+def system_kind(it):
+    """Which System kind an item is: its sender's tags (wizard-system + kind), else its known title. None if not System."""
+    import re
+    tags = [str(t) for t in (it.get("tags") or [])]
+    if "wizard-system" in tags:
+        for k in SYSTEM_KINDS:
+            if k in tags:
+                return k
+    title = str(it.get("title") or "").strip()
+    for k, (_, rx) in SYSTEM_KINDS.items():
+        if re.fullmatch(rx, title, re.I):
+            return k
+    return None
+
+
+def needs_you(it):
+    import re
+    return "needs-you" in (it.get("tags") or []) or int(it.get("priority") or 3) >= 4 or \
+        bool(re.search(r"need(s)? (a look|your OK|you)", str(it.get("title") or ""), re.I))
+
+
+def item_route_id(it):
+    k = system_kind(it)
+    return "system:" + k if k and not needs_you(it) else "notifications"
+
+
+def daily_items(hours=24, now=None):
+    """What waits for the Morning Report: items of the last `hours` whose source is set to Daily, grouped by source.
+    Something that needs the owner is never here (it follows Notifications' own choice)."""
+    now = now or time.time()
+    try:
+        hours = max(1, min(int(hours), 72))
+    except (TypeError, ValueError):
+        hours = 24
+    r = inbox_routes()
+    routes = {**r["defaults"], **r["routes"]}
+    groups = {}
+    for it in inbox_items("all", 500)["items"]:
+        if now - float(it.get("time") or 0) > hours * 3600:
+            continue
+        rid = item_route_id(it)
+        if routes.get(rid) != "daily":
+            continue
+        g = groups.setdefault(rid, {"source": rid, "name": SYSTEM_KINDS[rid[7:]][0] if rid.startswith("system:") else "Notifications", "items": []})
+        g["items"].append({"id": it["id"], "time": it["time"], "title": it["title"], "message": it["message"][:500]})
+    return {"hours": hours, "groups": list(groups.values())}
+
+
 @tool("notifications_inbox", "Read the owner's notification inbox (agent notes and scheduled-job results) with what they "
       "have read, flagged or archived. Use it to answer 'what came in', 'what failed overnight' or 'what did I flag'.",
       {"view": {"type": "string", "enum": ["inbox", "flagged", "archive", "all"], "description": "default inbox"},
@@ -401,6 +532,24 @@ def inbox_route(method, path, query, headers, body):
             return _json(200, set_inbox_source(d.get("app"), chats=d.get("chats"), phone=d.get("phone")))
         except ValueError as e:
             return _json(400, {"error": str(e)})
+    if method == "GET" and sub == "api/routes":
+        return _json(200, inbox_routes())
+    if method == "POST" and sub == "api/routes":
+        # JSON only and small: { "routes": { "<source>": "chats"|"badge"|"daily"|"off" } }.
+        if not headers.get("content-type", "").startswith("application/json"):
+            return _json(415, {"error": "send application/json"})
+        if len(body or b"") > SOURCES_MAX_BODY * 4:
+            return _json(413, {"error": "request too large"})
+        try:
+            d = json.loads(body or b"{}")
+        except ValueError:
+            return _json(400, {"error": "bad json"})
+        try:
+            return _json(200, set_inbox_routes(d.get("routes") if isinstance(d, dict) else None))
+        except ValueError as e:
+            return _json(400, {"error": str(e)})
+    if method == "GET" and sub == "api/daily":
+        return _json(200, daily_items((q.get("hours") or [24])[0]))
     if method == "GET" and sub.startswith("media/"):
         # /notifications/media/<absolute path>: the path keeps its image extension so the shell's viewer opens it.
         return media_file("/" + urllib.parse.unquote(sub[len("media/"):]))
