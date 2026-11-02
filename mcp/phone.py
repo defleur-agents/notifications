@@ -160,13 +160,17 @@ def ingest_feed(app, feed, now=None):
         db = _db()
         try:
             prev = {k: (t, h, s) for k, t, h, s in db.execute("SELECT key, time, hash, shown FROM items WHERE app=?", (app,))}
+            # The first feed an app ever sends is its backlog (every chat already unread): shown quietly, no buzz each.
+            first = db.execute("SELECT 1 FROM meta WHERE k=?", ("seen:" + app,)).fetchone() is None
+            if first:
+                db.execute("INSERT INTO meta VALUES (?, ?)", ("seen:" + app, str(int(now))))
             for key, it in items.items():
                 h = hashlib.sha256(json.dumps(it, sort_keys=True).encode()).hexdigest()[:20]
                 old = prev.get(key)
                 shown = bool(old and old[2])
                 if route == "chats" and (old is None or old[1] != h):
                     # Newer activity alerts; the same activity re-worded (a translation, a name) updates quietly.
-                    alert = old is None or it["time"] > old[0]
+                    alert = not first and (old is None or it["time"] > old[0])
                     _event(db, dict(it, type="notify", app=app, alert=alert), now)
                     made += 1
                     shown = True

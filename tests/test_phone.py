@@ -68,8 +68,18 @@ class RouterTests(unittest.TestCase):
         self.assertIsNone(db.execute("SELECT data FROM items").fetchone()[0], "a Badge app's words are never stored")
         db.close()
 
+    def test_first_feed_is_a_quiet_backlog(self):
+        self.route("messenger", "chats")
+        self.ns["ingest_feed"]("messenger", feed(CARLOS, {"key": "chat:ana", "title": "Ana", "text": "old", "time": 900}))
+        ev = self.events()
+        self.assertEqual([(e["key"], e["alert"]) for e in ev], [("chat:carlos", False), ("chat:ana", False)],
+                         "an app's first feed (everything already unread) shows without a buzz per chat")
+        self.ns["ingest_feed"]("messenger", feed(CARLOS, {"key": "chat:ana", "title": "Ana", "text": "new", "time": 950}))
+        self.assertTrue(self.events()[-1]["alert"], "after that, newer activity alerts")
+
     def test_chats_notifies_new_then_newer_then_quiet_reword_then_clear(self):
         self.route("messenger", "chats")
+        self.ns["ingest_feed"]("messenger", feed())          # Messenger's start-up feed: nothing unread yet
         self.ns["ingest_feed"]("messenger", feed(CARLOS))
         ev = self.events()
         self.assertEqual(len(ev), 1)
@@ -202,6 +212,7 @@ class StreamTests(unittest.TestCase):
         self.ns = load(self.tmp.name, {"FRONT_PORT": str(self.port)})
         self.ns["peer_name"] = lambda ip: ""
         self.ns["set_inbox_routes"]({"messenger": "chats"})
+        self.ns["ingest_feed"]("messenger", feed())
         import asyncio
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=lambda: self.loop.run_until_complete(self.ns["main"]()), daemon=True).start()
@@ -247,6 +258,7 @@ class StreamTests(unittest.TestCase):
         self.assertLess(time.time() - t0, 1.0, "instant, not a poll")
         self.assertEqual(ev["event"], "notify")
         self.assertEqual(json.loads(ev["data"])["title"], "Carlos")
+        self.assertTrue(json.loads(ev["data"])["alert"])
         last = int(ev["id"])
         c.close()
         # Offline (Tailscale off): two more things happen.
