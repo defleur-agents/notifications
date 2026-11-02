@@ -4,7 +4,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 web = root / 'web' / 'minimal'
 gate = """(() => {
- const ours = new Set(['obsidian','obsidian-light','landscapes']);
+ const ours = new Set(['obsidian','obsidian-light','landscapes','landscapes-light']);
  const minimal = new URL(location.href).searchParams.get('layout') === 'minimal';
  window.WizardApp?.theme.onChange(theme => {
    const skin = theme?.skin?.id || theme?.skin || document.documentElement.dataset.skin;
