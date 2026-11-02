@@ -48,7 +48,7 @@
    * these touches; the gesture lives here. The list next to the detail is an inert copy of the real list. */
   const strip = (() => {
     const LOCK = 10, RATIO = 1.3, GO = 70, VGO = 0.45, MS = 240, EASE = 'cubic-bezier(.2,.8,.2,1)', EDGE = 24;
-    const OURS = new Set(['obsidian', 'obsidian-light', 'landscapes']);
+    const OURS = new Set(['obsidian', 'obsidian-light', 'landscapes', 'landscapes-light']);
     const app = document.querySelector('.wz-app');
     let G = null, ghost = null, anims = [], blockClick = 0;
     const api = {dirty: false};
