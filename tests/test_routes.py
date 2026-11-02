@@ -47,6 +47,7 @@ class RouteTests(unittest.TestCase):
         self.assertFalse(d["saved"])
         self.assertEqual(d["defaults"]["notifications"], "chats")
         self.assertEqual(d["defaults"]["system:app-updates"], "daily")
+        self.assertEqual(d["names"]["system:app-updates"], "App updates", "the Morning Report matches its lines by name")
 
     def test_save_is_one_place_per_source_and_survives_a_reload(self):
         code, d = self.call("POST", "api/routes", {"routes": {"messenger": "badge", "system:connections": "off"}})

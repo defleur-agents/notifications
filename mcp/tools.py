@@ -278,7 +278,7 @@ def set_inbox_source(app, chats=None, phone=None):
 
 
 # ---- Routes: where each source's notifications go, ONE place each (Miguel, 2 Nov 2026) ----
-# Chats (a thread that waits), Badge (a count on its icon), Daily (one line in tomorrow's Morning Report) or Off (only
+# Chats (a thread that waits), Badge (a count on its icon), Morning report ("daily": one line in tomorrow's report) or Off (only
 # this app's history). Stored on the box, so every device shows the same choice. Sources: an app id, "notifications"
 # (the agent's own alerts) or "system:<kind>" for notices about Wizard itself. Daily is for Notifications and System
 # only: an app's own items (Mail, Messenger) would lose their point if they waited a day.
@@ -291,6 +291,8 @@ SYSTEM_KINDS = {
 }
 ROUTE_DEFAULTS = {"notifications": "chats", **{"system:" + k: "daily" for k in SYSTEM_KINDS}}
 ROUTES_MAX = 300
+# What a source is called (the Morning Report's Overnight lines use these, so its picker knows which line is which).
+ROUTE_NAMES = {"notifications": "Notifications", **{"system:" + k: v[0] for k, v in SYSTEM_KINDS.items()}}
 
 
 def _route_id(i):
@@ -323,7 +325,8 @@ def inbox_routes():
     except (OSError, ValueError):
         d = {}
     saved = _clean_routes(d.get("routes") if isinstance(d, dict) else None)
-    return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "saved": bool(saved) or bool(isinstance(d, dict) and d.get("saved"))}
+    return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "names": ROUTE_NAMES,
+            "saved": bool(saved) or bool(isinstance(d, dict) and d.get("saved"))}
 
 
 def set_inbox_routes(changes):
