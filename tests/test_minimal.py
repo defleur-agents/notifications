@@ -10,7 +10,8 @@ def constants(path):
     return result
 class MinimalInboxTests(unittest.TestCase):
     def test_skin_gate(self):
-        gate = constants(ROOT/'mcp/minimal_assets.py')['MINIMAL_ASSETS']['layout.js'][1]
+        ns = {}; exec((ROOT/'mcp/minimal_assets.py').read_text(), ns)
+        gate = ns['MINIMAL_ASSETS']['layout.js'][1]
         for skin in ['obsidian','obsidian-light','landscapes','landscapes-light','nebula','grove','tide','ember','signal']:
             for minimal in [False, True]:
                 url = 'https://wizard.example/notifications/' + ('?layout=minimal' if minimal else '')
@@ -41,4 +42,10 @@ class MinimalInboxTests(unittest.TestCase):
     def test_mark_unread_never_wraps(self):
         css = (ROOT/'web/minimal/styles.css').read_text()
         self.assertIn('.act span { max-width: 100%; white-space: nowrap;', css)
+    def test_front_fits_one_exec_argument(self):
+        # Linux refuses any single exec argument over 128 KiB ("argument list too long"): the inlined front is one.
+        text = (ROOT/'runtipi/docker-compose.yml').read_text()
+        block = text.split('# BEGIN MCP FRONT', 1)[1].split('# END MCP FRONT', 1)[0].split('\n', 2)[2]
+        self.assertGreater(len(block), 10000)
+        self.assertLess(len(block.encode()), 120 * 1024)   # with indentation, so the real argument is smaller still
 if __name__ == '__main__': unittest.main()
