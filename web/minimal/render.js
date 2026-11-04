@@ -101,5 +101,16 @@
     if (diff > 1 && diff < 7) return d.toLocaleDateString(undefined, {weekday: 'short'}) + ' ' + time;
     return d.toLocaleDateString(undefined, {day: 'numeric', month: 'short', ...(d.getFullYear() !== n.getFullYear() ? {year: 'numeric'} : {})}) + ' ' + time;
   }
-  root.NotifRender = Object.freeze({parse, inline, safeHref, firstLinkText, dropLink, friendlyTime});
+  /* The list's quiet time: 10:34 today, then Yesterday, a weekday this week, else 3 Nov (with the year when not this year). */
+  function shortTime(seconds, now) {
+    const d = new Date(Number(seconds) * 1000); if (!seconds || Number.isNaN(d.getTime())) return '';
+    const n = now ? new Date(now) : new Date();
+    const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const diff = Math.round((day(n) - day(d)) / 86400000);
+    if (diff <= 0) return d.toLocaleTimeString(undefined, {hour: 'numeric', minute: '2-digit'});
+    if (diff === 1) return 'Yesterday';
+    if (diff < 7) return d.toLocaleDateString(undefined, {weekday: 'short'});
+    return d.toLocaleDateString(undefined, {day: 'numeric', month: 'short', ...(d.getFullYear() !== n.getFullYear() ? {year: 'numeric'} : {})});
+  }
+  root.NotifRender = Object.freeze({parse, inline, safeHref, firstLinkText, dropLink, friendlyTime, shortTime});
 })(typeof window !== 'undefined' ? window : globalThis);

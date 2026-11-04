@@ -8,7 +8,10 @@
 }
 html, body { background: var(--nt-page); }
 html.wz-hosted body { background: var(--nt-page); }
-.wz-app { max-width: 760px; width: 100%; background: var(--nt-page); }
+/* The window is the page (design rules): no frame max-width; only the detail's reading line is capped. */
+.wz-app { max-width: none; width: 100%; background: var(--nt-page); }
+#detail { max-width: 720px; }
+#subject:focus { outline: none; }
 .wz-scroll { padding: 8px 18px; overscroll-behavior: contain; }
 [hidden] { display: none !important; }
 button, a { -webkit-tap-highlight-color: transparent; }
@@ -21,14 +24,23 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .subject-row:hover { background: var(--fill); }
 .subject-row .title { min-width: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 450; color: var(--ink-2); }
 .subject-row.unread .title { font-weight: 650; color: var(--ink); }
+.subject-row .when { flex: none; font-size: var(--wz-text-sm, .8125rem); color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.subject-row.unread .when { color: var(--ink-2); }
+/* Narrow windows: newest at the bottom, a short list sits down by the thumb. */
+html.nt-up .wz-scroll { display: flex; flex-direction: column; }
+html.nt-up #overview { margin-top: auto; }
+html.nt-up #overview .wz-list li:last-child .subject-row { border-bottom: 0; }
 .dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%; background: transparent; }
 .unread .dot { background: var(--accent); }
 
 /* ---- bottom filter bar (list only) ---- */
-.nt-toolbar { flex: none; position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 18px max(44px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--nt-page); }
+.nt-toolbar { flex: none; position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 18px 12px; border-top: 1px solid var(--line); background: var(--nt-page); }
+/* The shell already keeps the window above the dock; only full screen reaches the home bar. */
+html[data-presentation="immersive"] .nt-toolbar { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 .nt-filters { display: flex; border-radius: 99px; background: var(--nt-btn); border: 1px solid var(--line-2); padding: 3px; }
 .nt-filters button { min-width: 92px; padding: 0 18px; border-radius: 99px; color: var(--ink-2); font-weight: 550; }
 .nt-filters button[aria-pressed="true"] { background: var(--ink); color: var(--nt-page); font-weight: 700; }
+.nt-more.on { background: var(--ink); color: var(--nt-page); border-color: var(--ink); font-weight: 700; }
 .nt-more { color: var(--ink); padding: 0 14px; border-radius: 99px; border: 1px solid var(--line-2); background: var(--nt-btn); font-weight: 550; }
 .nt-options { position: absolute; right: 18px; bottom: calc(100% + 4px); min-width: 180px; padding: 8px; border: 1px solid var(--nt-btn-line); border-radius: 16px; background: var(--nt-page); box-shadow: 0 10px 36px var(--line); z-index: 3; }
 .nt-options button { display: block; width: 100%; padding: 0 12px; text-align: left; border-radius: 8px; }
@@ -37,24 +49,24 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 /* ---- detail: Back, subject, one time, body, one primary action, one compact row ---- */
 #back { color: var(--ink); padding: 0 14px 0 8px; margin-left: -8px; border-radius: 99px; font-weight: 550; }
 #back:hover { background: var(--fill); }
-#subject { font-size: 22px; line-height: 1.3; margin: 14px 0 4px; overflow-wrap: anywhere; color: var(--ink); }
-#meta { margin: 0; font-size: 13px; color: var(--ink-2); }
+#subject { font-size: var(--wz-text-xl, 1.375rem); line-height: 1.3; margin: 14px 0 4px; overflow-wrap: anywhere; color: var(--ink); }
+#meta { margin: 0; font-size: var(--wz-text-sm, .8125rem); color: var(--ink-2); }
 #body { margin: 20px 0 24px; overflow-wrap: anywhere; line-height: 1.6; color: var(--ink); }
 #body p { margin: 0 0 14px; }
 #body .body-link.dup { color: var(--ink-2); font-weight: 450; text-decoration-thickness: 1px; }
 #body .body-link { color: var(--nt-link); text-decoration: underline; text-decoration-thickness: 1.5px; text-underline-offset: 3px; font-weight: 600; padding: 2px 0; }
-#body code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .9em; padding: 1px 6px; border-radius: 6px; background: var(--nt-btn); border: 1px solid var(--line); }
+#body code { font-family: var(--wz-font-mono, ui-monospace, monospace); font-size: .9em; padding: 1px 6px; border-radius: 6px; background: var(--nt-btn); border: 1px solid var(--line); }
 #body strong { font-weight: 700; }
 .thumb { display: block; width: fit-content; max-width: 100%; margin: 0 0 16px; border-radius: 12px; overflow: hidden; border: 1px solid var(--nt-btn-line); background: var(--nt-btn); }
 .thumb img { display: block; max-width: 100%; max-height: 240px; width: auto; height: auto; object-fit: contain; }
-.thumb-missing { margin: 0 0 16px; font-size: 13px; color: var(--ink-3); }
+.thumb-missing { margin: 0 0 16px; font-size: var(--wz-text-sm, .8125rem); color: var(--ink-3); }
 .btn-primary { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 50px; padding: 0 18px; border-radius: 14px; background: var(--accent); color: var(--on-accent); font-weight: 700; text-decoration: none; border: 0; }
 .btn-primary svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .actions { display: flex; gap: 6px; margin: 10px 0 0; }
 /* Buttons share the row by label length, so a two-word label like Mark unread stays on one line even at 320px. */
-.act { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-height: 58px; padding: 6px 5px; border-radius: 14px; background: var(--nt-btn); border: 1px solid var(--nt-btn-line); color: var(--ink); font-size: 12.5px; font-weight: 600; line-height: 1.15; text-align: center; }
+.act { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; min-height: 58px; padding: 6px 5px; border-radius: 14px; background: var(--nt-btn); border: 1px solid var(--nt-btn-line); color: var(--ink); font-size: .78rem; font-weight: 600; line-height: 1.15; text-align: center; }
 .act span { max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 359px) { .act { font-size: 11.5px; padding: 6px 3px; } .actions { gap: 5px; } }
+@media (max-width: 359px) { .act { font-size: .72rem; padding: 6px 3px; } .actions { gap: 5px; } }
 .act svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
 .act[aria-pressed="true"] { border-color: var(--accent); color: var(--nt-link); }
 .act:hover { background: color-mix(in srgb, var(--ink) 14%, var(--nt-page)); }
