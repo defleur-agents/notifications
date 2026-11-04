@@ -4,6 +4,20 @@
 # their phone at it.
 
 TOPIC = os.environ.get("NOTIFY_TOPIC", "wizard")
+# A notification about one app carries the tag `app:<app id>`: the inbox files it under that app (its name, mark and
+# Chats / Badge / Off choice) instead of the agent's own group. Untagged = the agent's own.
+import re as _re
+APP_TAG = "app:"
+APP_ID_RX = _re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+
+def item_app(tags):
+    """The app a notification is about (its `app:<id>` tag), or ''."""
+    for t in tags or []:
+        t = str(t)
+        if t.startswith(APP_TAG) and APP_ID_RX.fullmatch(t[len(APP_TAG):]):
+            return t[len(APP_TAG):]
+    return ""
 PRIORITIES = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
 
 
@@ -27,9 +41,11 @@ def _clean(text, limit):
        "title": {"type": "string", "description": "Short title, e.g. 'Video ready' (optional)"},
        "priority": {"type": "string", "enum": list(PRIORITIES), "description": "default unless it is urgent"},
        "link": {"type": "string", "description": "https link to open when tapped (optional)"},
-       "tags": {"type": "string", "description": "Comma-separated emoji short codes, e.g. 'white_check_mark' (optional)"}},
+       "tags": {"type": "string", "description": "Comma-separated emoji short codes, e.g. 'white_check_mark' (optional)"},
+       "app": {"type": "string", "description": "Id of the installed app this is about, e.g. 'sniper' (optional): it is "
+               "then listed under that app and follows that app's notification choice; leave empty for your own"}},
       ["message"])
-def notify(message, title="", priority="default", link="", tags=""):
+def notify(message, title="", priority="default", link="", tags="", app=""):
     _box_only()
     body = _clean(message, 4000)
     if not body:
@@ -43,7 +59,12 @@ def notify(message, title="", priority="default", link="", tags=""):
             raise ValueError("link must be an https:// address")
         payload["click"] = url[:2000]
     if tags:
-        payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t][:5]
+        payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t and not t.startswith(APP_TAG)][:5]
+    app = str(app or "").strip().lower()
+    if app:
+        if not APP_ID_RX.fullmatch(app):
+            raise ValueError("app is an app id like 'sniper'")
+        payload["tags"] = payload.get("tags", []) + [APP_TAG + app]
     status, raw = http("POST", "/", json.dumps(payload).encode(), {"Content-Type": "application/json"}, timeout=20)
     sent = json.loads(raw or b"{}")
     return {"sent": True, "id": sent.get("id"), "topic": TOPIC, "time": sent.get("time")}
@@ -129,6 +150,7 @@ def inbox_items(view="inbox", limit=200):
         it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""),
               "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
               "source": "cron" if "cron" in tags else "agent",
+              **({"from": item_app(tags)} if item_app(tags) else {}),
               "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
         items.append(it)
     counts = {"unread": sum(1 for i in items if not i["read"] and not i["archived"]),
@@ -413,6 +435,9 @@ def needs_you(it):
 
 
 def item_route_id(it):
+    app = item_app(it.get("tags"))
+    if app and not needs_you(it):
+        return app
     k = system_kind(it)
     return "system:" + k if k and not needs_you(it) else "notifications"
 

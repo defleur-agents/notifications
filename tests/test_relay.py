@@ -196,6 +196,48 @@ class RelayTests(unittest.TestCase):
         self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
         self.run_once(); self.assertEqual(self.posts[0][0], "Failed: Backup check")
 
+    def test_job_apps_tag_posts_with_their_app(self):
+        ns = load({"CRON_JOB_APPS": "job1=backup, Morning briefing = morning-report, bad=Not An Id"})
+        self.assertEqual(ns["CRON_JOB_APPS"], {"job1": "backup", "morning briefing": "morning-report"})
+        self.add("job1", "2026-10-24_01-00-00.md", run_md(response="All 3 backups fresh."), self.t0)
+        self.add("other", "2026-10-24_01-00-00.md", run_md(response="Something of the agent's own."), self.t0)
+        self.add("morning", "2026-10-24_02-00-00.md", run_md(status="failed", error="boom"), self.t0)
+        ns["cron_relay_once"](str(self.cron), self.state, self.post, time.time())
+        tags = {p[0]: p[3] for p in self.posts}
+        self.assertEqual(tags["Backup check"], ["cron", "clock", "app:backup"])
+        self.assertEqual(tags["Demo"], ["cron", "clock"])                       # unlisted: the agent's own
+        self.assertEqual(tags["Failed: Morning briefing"], ["cron", "warning", "app:morning-report"])  # by name
+
+    def test_escalation_keeps_the_app_tag(self):
+        ns = load({"CRON_JOB_APPS": "job1=backup", "CRON_FAILURES": "agent"})
+        now = time.time()
+        self.add("job1", "2026-10-24_01-00-00.md", run_md(status="failed", error="disk full"), now - 3600 * 30)
+        st = self.root / "state.json"; st.write_text(json.dumps({"since": now - 3600 * 40, "done": []}))
+        ns["cron_relay_once"](str(self.cron), self.state, self.post, now)
+        self.assertEqual([p[0] for p in self.posts], ["Still failing: Backup check"])
+        self.assertIn("app:backup", self.posts[0][3])
+
+    def test_item_app_and_route(self):
+        ns = self.ns
+        self.assertEqual(ns["item_app"](["cron", "app:sniper"]), "sniper")
+        self.assertEqual(ns["item_app"](["app:Bad Id", "cron"]), "")
+        self.assertEqual(ns["item_route_id"]({"tags": ["cron", "app:sniper"], "priority": 2}), "sniper")
+        # needs you: follows Notifications' own choice, like System notices do
+        self.assertEqual(ns["item_route_id"]({"tags": ["cron", "app:sniper"], "priority": 4}), "notifications")
+        self.assertEqual(ns["item_route_id"]({"tags": ["cron"], "priority": 2}), "notifications")
+
+    def test_notify_app_param_tags_the_post(self):
+        ns = self.ns; sent = []
+        ns["REQUEST"].set({})
+        ns["http"] = lambda m, path, body=None, headers=None, timeout=0: (sent.append(json.loads(body)) or (200, b'{"id":"x"}'))
+        ns["notify"].__globals__["http"] = ns["http"]
+        ns["notify"]("Aree replied", title="Aree", app="second-hand", tags="wave,app:spoof")
+        self.assertEqual(sent[-1]["tags"], ["wave", "app:second-hand"])
+        ns["notify"]("plain")
+        self.assertNotIn("tags", sent[-1])
+        with self.assertRaises(ValueError):
+            ns["notify"]("x", app="../etc")
+
     def test_compose_is_generated_and_has_no_dollar_in_front(self):
         self.assertNotIn("$", (ROOT / "mcp" / "relay.py").read_text())
 

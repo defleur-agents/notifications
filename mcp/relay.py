@@ -18,6 +18,11 @@
 # closes it. Safety net: a failure still open and unacknowledged after CRON_ESCALATE_H hours posts once per episode,
 # and the responder's own runs always post (its failures included), so a broken responder is never silent.
 # CRON_FAILURES=owner forces the old behaviour (every failure posts); =agent forces routing even without a responder.
+#
+# Which app a job is about: CRON_JOB_APPS = "<job id or name>=<app id>, ..." tags that job's posts `app:<app id>`
+# (APP_TAG), so the inbox files them under that app (its name, its mark, its own Chats / Badge / Off choice) instead
+# of the agent's catch-all group. Unlisted jobs are the agent's own. A shell without that app installed shows them as
+# the agent's again, so naming an app that is not installed yet is harmless.
 import hashlib
 import re
 
@@ -31,6 +36,19 @@ CRON_STATE = os.environ.get("CRON_STATE", os.path.join(os.path.dirname(STATE_FIL
 CRON_FAILURES = os.environ.get("CRON_FAILURES", "auto").strip().lower()
 CRON_RESPONDER = {x.strip().lower() for x in os.environ.get("CRON_RESPONDER", "Failure responder").split(",") if x.strip()}
 CRON_ESCALATE_H = float(os.environ.get("CRON_ESCALATE_H", "24") or 24)
+
+
+def _job_apps(raw):
+    out = {}
+    for part in str(raw or "").split(","):
+        job, _, app = part.partition("=")
+        job, app = job.strip().lower(), app.strip().lower()
+        if job and APP_ID_RX.fullmatch(app):
+            out[job] = app
+    return out
+
+
+CRON_JOB_APPS = _job_apps(os.environ.get("CRON_JOB_APPS", ""))
 _EOL = r"[ \t]*(?=\n|\Z)"   # end of line without a dollar sign (compose would interpolate one)
 _relay_lock = threading.Lock()
 
@@ -47,6 +65,11 @@ def _jobs(cron_dir):
 
 def _job_names(cron_dir):
     return {j["id"]: j.get("name") or j["id"] for j in _jobs(cron_dir)}
+
+
+def _app_tags(job, name):
+    app = CRON_JOB_APPS.get(str(job).lower()) or CRON_JOB_APPS.get(str(name).strip().lower())
+    return [APP_TAG + app] if app else []
 
 
 def _is_responder(job, name):
@@ -213,7 +236,7 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
             when = time.strftime("%d %b %H:%M UTC", time.gmtime(mt))
             try:
                 ok = post(("Failed: " if failed else "") + str(name), "%s\n\n%s" % (body, when),
-                          4 if failed or responder else 2, ["cron", "warning" if failed or responder else "clock"])
+                          4 if failed or responder else 2, ["cron", "warning" if failed or responder else "clock"] + _app_tags(job, name))
             except OSError:
                 ok = False
             if not ok:
@@ -246,7 +269,7 @@ def _escalate(open_f, ack, post, now):
         hours = int((now - float(o["first_seen"])) // 3600)
         msg = "Failing for %d hours and the agent has not fixed it yet. Latest:\n%s" % (hours, o.get("body", ""))
         try:
-            ok = post("Still failing: " + o.get("name", job), msg, 4, ["cron", "warning"])
+            ok = post("Still failing: " + o.get("name", job), msg, 4, ["cron", "warning"] + _app_tags(job, o.get("name", job)))
         except OSError:
             ok = False
         if ok:

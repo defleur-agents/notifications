@@ -17,7 +17,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: notifications
-      APP_VERSION: 2.29.0-wizard21
+      APP_VERSION: 2.29.0-wizard22
       FRONT_PORT: '8080'
       UPSTREAM_HOST: notifications-engine
       UPSTREAM_PORT: '8080'
@@ -32,6 +32,8 @@ services:
       # Scheduled-job relay: the agent's Hermes cron folder, read-only. Empty folder = relay idle.
       CRON_DIR: /hermes-cron
       CRON_QUIET_JOBS: ${CRON_QUIET_JOBS:-}
+      # job=app pairs: those jobs' results are listed under that app (tag app:<id>) instead of the agent's own.
+      CRON_JOB_APPS: ${CRON_JOB_APPS:-}
       CRON_RELAY: ${CRON_RELAY:-on}
       # Failures go to the agent's 'Failure responder' cron job when one exists (auto); owner = always post.
       CRON_FAILURES: ${CRON_FAILURES:-auto}
@@ -327,6 +329,20 @@ services:
       # their phone at it.
 
       TOPIC = os.environ.get("NOTIFY_TOPIC", "wizard")
+      # A notification about one app carries the tag `app:<app id>`: the inbox files it under that app (its name, mark and
+      # Chats / Badge / Off choice) instead of the agent's own group. Untagged = the agent's own.
+      import re as _re
+      APP_TAG = "app:"
+      APP_ID_RX = _re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+
+      def item_app(tags):
+          """The app a notification is about (its `app:<id>` tag), or ''."""
+          for t in tags or []:
+              t = str(t)
+              if t.startswith(APP_TAG) and APP_ID_RX.fullmatch(t[len(APP_TAG):]):
+                  return t[len(APP_TAG):]
+          return ""
       PRIORITIES = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
 
 
@@ -350,9 +366,11 @@ services:
              "title": {"type": "string", "description": "Short title, e.g. 'Video ready' (optional)"},
              "priority": {"type": "string", "enum": list(PRIORITIES), "description": "default unless it is urgent"},
              "link": {"type": "string", "description": "https link to open when tapped (optional)"},
-             "tags": {"type": "string", "description": "Comma-separated emoji short codes, e.g. 'white_check_mark' (optional)"}},
+             "tags": {"type": "string", "description": "Comma-separated emoji short codes, e.g. 'white_check_mark' (optional)"},
+             "app": {"type": "string", "description": "Id of the installed app this is about, e.g. 'sniper' (optional): it is "
+                     "then listed under that app and follows that app's notification choice; leave empty for your own"}},
             ["message"])
-      def notify(message, title="", priority="default", link="", tags=""):
+      def notify(message, title="", priority="default", link="", tags="", app=""):
           _box_only()
           body = _clean(message, 4000)
           if not body:
@@ -366,7 +384,12 @@ services:
                   raise ValueError("link must be an https:// address")
               payload["click"] = url[:2000]
           if tags:
-              payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t][:5]
+              payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t and not t.startswith(APP_TAG)][:5]
+          app = str(app or "").strip().lower()
+          if app:
+              if not APP_ID_RX.fullmatch(app):
+                  raise ValueError("app is an app id like 'sniper'")
+              payload["tags"] = payload.get("tags", []) + [APP_TAG + app]
           status, raw = http("POST", "/", json.dumps(payload).encode(), {"Content-Type": "application/json"}, timeout=20)
           sent = json.loads(raw or b"{}")
           return {"sent": True, "id": sent.get("id"), "topic": TOPIC, "time": sent.get("time")}
@@ -452,6 +475,7 @@ services:
               it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""),
                     "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
                     "source": "cron" if "cron" in tags else "agent",
+                    **({"from": item_app(tags)} if item_app(tags) else {}),
                     "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
               items.append(it)
           counts = {"unread": sum(1 for i in items if not i["read"] and not i["archived"]),
@@ -736,6 +760,9 @@ services:
 
 
       def item_route_id(it):
+          app = item_app(it.get("tags"))
+          if app and not needs_you(it):
+              return app
           k = system_kind(it)
           return "system:" + k if k and not needs_you(it) else "notifications"
 
@@ -1088,6 +1115,11 @@ services:
       # closes it. Safety net: a failure still open and unacknowledged after CRON_ESCALATE_H hours posts once per episode,
       # and the responder's own runs always post (its failures included), so a broken responder is never silent.
       # CRON_FAILURES=owner forces the old behaviour (every failure posts); =agent forces routing even without a responder.
+      #
+      # Which app a job is about: CRON_JOB_APPS = "<job id or name>=<app id>, ..." tags that job's posts `app:<app id>`
+      # (APP_TAG), so the inbox files them under that app (its name, its mark, its own Chats / Badge / Off choice) instead
+      # of the agent's catch-all group. Unlisted jobs are the agent's own. A shell without that app installed shows them as
+      # the agent's again, so naming an app that is not installed yet is harmless.
       import hashlib
       import re
 
@@ -1101,6 +1133,19 @@ services:
       CRON_FAILURES = os.environ.get("CRON_FAILURES", "auto").strip().lower()
       CRON_RESPONDER = {x.strip().lower() for x in os.environ.get("CRON_RESPONDER", "Failure responder").split(",") if x.strip()}
       CRON_ESCALATE_H = float(os.environ.get("CRON_ESCALATE_H", "24") or 24)
+
+
+      def _job_apps(raw):
+          out = {}
+          for part in str(raw or "").split(","):
+              job, _, app = part.partition("=")
+              job, app = job.strip().lower(), app.strip().lower()
+              if job and APP_ID_RX.fullmatch(app):
+                  out[job] = app
+          return out
+
+
+      CRON_JOB_APPS = _job_apps(os.environ.get("CRON_JOB_APPS", ""))
       _EOL = r"[ \t]*(?=\n|\Z)"   # end of line without a dollar sign (compose would interpolate one)
       _relay_lock = threading.Lock()
 
@@ -1117,6 +1162,11 @@ services:
 
       def _job_names(cron_dir):
           return {j["id"]: j.get("name") or j["id"] for j in _jobs(cron_dir)}
+
+
+      def _app_tags(job, name):
+          app = CRON_JOB_APPS.get(str(job).lower()) or CRON_JOB_APPS.get(str(name).strip().lower())
+          return [APP_TAG + app] if app else []
 
 
       def _is_responder(job, name):
@@ -1283,7 +1333,7 @@ services:
                   when = time.strftime("%d %b %H:%M UTC", time.gmtime(mt))
                   try:
                       ok = post(("Failed: " if failed else "") + str(name), "%s\n\n%s" % (body, when),
-                                4 if failed or responder else 2, ["cron", "warning" if failed or responder else "clock"])
+                                4 if failed or responder else 2, ["cron", "warning" if failed or responder else "clock"] + _app_tags(job, name))
                   except OSError:
                       ok = False
                   if not ok:
@@ -1316,7 +1366,7 @@ services:
               hours = int((now - float(o["first_seen"])) // 3600)
               msg = "Failing for %d hours and the agent has not fixed it yet. Latest:\n%s" % (hours, o.get("body", ""))
               try:
-                  ok = post("Still failing: " + o.get("name", job), msg, 4, ["cron", "warning"])
+                  ok = post("Still failing: " + o.get("name", job), msg, 4, ["cron", "warning"] + _app_tags(job, o.get("name", job)))
               except OSError:
                   ok = False
               if ok:
