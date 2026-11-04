@@ -56,4 +56,13 @@ const two = R.parse('[A](https://a.example/) and [B](https://b.example/)', 0);
 assert.strictEqual(R.dropLink(two, 'https://a.example/'), two, 'several links: kept (the duplicate is only quieted)');
 const other = R.parse('[A](https://a.example/)', 0);
 assert.strictEqual(R.dropLink(other, 'https://z.example/'), other, 'a different link is kept');
+// List time: short and quiet.
+{
+  const now = new Date(2026, 10, 4, 15, 0).getTime(), at = (d, h) => new Date(2026, 10, d, h, 5).getTime() / 1000;
+  assert.ok(/5/.test(R.shortTime(at(4, 9), now)) && !/Nov/.test(R.shortTime(at(4, 9), now)), 'today: time only');
+  assert.strictEqual(R.shortTime(at(3, 9), now), 'Yesterday');
+  assert.ok(!/\d/.test(R.shortTime(at(1, 9), now)), 'this week: weekday');
+  assert.ok(/Oct/.test(R.shortTime(new Date(2026, 9, 20, 9).getTime() / 1000, now)), 'older: day and month');
+  assert.strictEqual(R.shortTime(0, now), '');
+}
 console.log('render tests: ok');

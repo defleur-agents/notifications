@@ -2,7 +2,10 @@
 (() => {
   const el = id => document.getElementById(id);
   const R = window.NotifRender;
-  let filter = 'unread', items = [], selected = null, generation = 0, busy = false, allReadArmed = false, listTop = 0;
+  let filter = 'unread', items = [], selected = null, generation = 0, busy = false, allReadArmed = false, listTop = 0, listGap = 0;
+  /* Thumb-first on narrow windows (Chats, Messenger): newest at the bottom, opened scrolled there. Wide windows read top-down. */
+  const narrow = () => innerWidth < 700;
+  const MORE = {flagged: 'Flagged', archive: 'Archive'};
   const titleOf = it => String(it.title || String(it.message || '').split('\n')[0] || 'Untitled notification');
   const say = text => { el('status').textContent = text || ''; };
   const disarmAllRead = () => { allReadArmed = false; el('allread').textContent = 'Mark all read'; };
@@ -25,16 +28,24 @@
   function visible() { return filter === 'unread' ? items.filter(it => !it.read) : items; }
   function paint() {
     if (strip.busy()) { strip.dirty = true; return; }
-    el('list').replaceChildren(...visible().map(it => {
+    const sc = el('scroll'), atEnd = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 4, rows = visible();
+    document.documentElement.classList.toggle('nt-up', narrow());
+    el('list').replaceChildren(...(narrow() ? rows.slice().reverse() : rows).map(it => {
       const li = node('li'), button = node('button', null, 'subject-row' + (it.read ? '' : ' unread'));
       button.type = 'button'; button.dataset.id = it.id;
-      button.setAttribute('aria-label', titleOf(it) + (it.read ? '' : ', unread'));
+      const when = R.shortTime(it.time);
+      button.setAttribute('aria-label', titleOf(it) + (it.read ? '' : ', unread') + (when ? ', ' + when : ''));
       const dot = node('span', '', 'dot'); dot.setAttribute('aria-hidden', 'true');
-      button.append(dot, node('span', titleOf(it), 'title')); li.append(button); return li;
+      const time = node('span', when, 'when'); time.setAttribute('aria-hidden', 'true');
+      button.append(dot, node('span', titleOf(it), 'title'), time); li.append(button); return li;
     }));
+    // Narrow: stay on the newest row when it was in view; never move the list while the owner reads further up.
+    if (narrow() && !selected && atEnd) sc.scrollTop = sc.scrollHeight;
     el('empty').hidden = visible().length !== 0;
     el('empty').textContent = filter === 'unread' ? 'No unread notifications' : filter === 'flagged' ? 'No flagged notifications' : filter === 'archive' ? 'No archived notifications' : 'No notifications';
     document.querySelectorAll('[data-filter]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.filter === filter)));
+    // More names the view it holds (Flagged, Archive), so the owner always sees where he is.
+    el('more').textContent = MORE[filter] || 'More'; el('more').classList.toggle('on', !!MORE[filter]);
     el('overview').hidden = !!selected; el('detail').hidden = !selected;
     // The detail is one quiet page: no filter bar under it.
     el('toolbar').hidden = !!selected; document.documentElement.classList.toggle('nt-detail', !!selected);
@@ -72,7 +83,7 @@
     };
     function mount(g) {
       ghost = g; document.documentElement.classList.add('nt-sliding'); document.body.append(g);
-      const sc = g.querySelector('.wz-scroll'); if (sc) sc.scrollTop = listTop;
+      const sc = g.querySelector('.wz-scroll'); if (sc) sc.scrollTop = narrow() ? sc.scrollHeight - sc.clientHeight - listGap : listTop;
     }
     function done() {
       anims.forEach(a => a.cancel()); anims = [];
@@ -218,7 +229,11 @@
       if (ok && selected && selected.id === it.id) closeDetail();
     }));
     acts.push(action(it.flag ? 'Unflag' : 'Flag', 'flag', () => mark([it.id], {flag: !it.flag})));
-    acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', () => mark([it.id], {archived: !it.archived})));
+    // Archive / Move to inbox finish this one too: back to the list, where the row has gone.
+    acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', async () => {
+      const ok = await mark([it.id], {archived: !it.archived});
+      if (ok && selected && selected.id === it.id) closeDetail();
+    }));
     if (it.flag) acts.find(b => b.textContent === 'Unflag')?.setAttribute('aria-pressed', 'true');
     row.style.setProperty('--n', String(acts.length)); row.replaceChildren(...acts);
   }
@@ -229,10 +244,11 @@
       const result = await api('items?view=' + encodeURIComponent(view) + '&limit=500');
       if (version !== generation) return;
       if (!Array.isArray(result.items)) throw new Error('Notifications returned an invalid list.');
+      const fresh = !items.length;
       items = result.items;
       if (selected) selected = items.find(it => it.id === selected.id) || selected;
       // A background refresh never rebuilds an open detail (pictures and scroll stay put).
-      if (selected) paintList(); else paint();
+      if (selected) paintList(); else { paint(); if (fresh && narrow()) el('scroll').scrollTop = el('scroll').scrollHeight; }
       say('');
       const c = result.counts || {};
       if (parent !== window) parent.postMessage({type: 'wizard:notifications:count', unread: Number(c.unread) || 0, needs: Number(c.needs) || 0}, location.origin);
@@ -252,10 +268,12 @@
     return ok;
   }
   function paintActionsOnly() { const top = el('scroll').scrollTop; paintDetail(); el('scroll').scrollTop = top; }
+  function saveListPlace() { const sc = el('scroll'); listTop = sc.scrollTop; listGap = Math.max(0, sc.scrollHeight - sc.scrollTop - sc.clientHeight); }
+  function toListPlace() { const sc = el('scroll'); sc.scrollTop = narrow() ? sc.scrollHeight - sc.clientHeight - listGap : listTop; }
   // Back to the list where it was: same scroll position, focus on the row without scrolling it.
   function showList() {
     if (!selected) return false;
-    const id = selected.id; selected = null; paint(); el('scroll').scrollTop = listTop;
+    const id = selected.id; selected = null; paint(); toListPlace();
     const row = [...document.querySelectorAll('.subject-row')].find(b => b.dataset.id === id); (row || el('scroll')).focus({preventScroll: true}); return true;
   }
   // Back (button, Escape, the shell's Back): on phone the list slides back in from the left, like Chats.
@@ -267,14 +285,14 @@
   el('list').onclick = e => {
     const b = e.target.closest('[data-id]'); if (!b || strip.busy()) return;
     const it = items.find(x => x.id === b.dataset.id); if (!it) return;
-    listTop = el('scroll').scrollTop;
+    saveListPlace();
     const ghost = strip.on() ? strip.snapshot() : null;
     selected = it; paint(); el('scroll').scrollTop = 0; el('subject').focus({preventScroll: true});
     if (ghost) strip.open(ghost);
   };
   document.querySelectorAll('[data-filter]').forEach(b => b.onclick = () => {
     disarmAllRead();
-    filter = b.dataset.filter; selected = null; el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('scroll').scrollTop = 0;
+    filter = b.dataset.filter; selected = null; el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('scroll').scrollTop = 0; listGap = 0;
     // Clear old rows while the new filter loads, never label stale data “All”.
     items = []; paint(); load();
   });
@@ -298,6 +316,8 @@
   window.WizardApp?.ready({name: 'Notifications'});
   window.WizardApp?.back?.register?.({canGoBack: () => !!selected || !el('options').hidden || !el('viewer').hidden, back: () => window.__wizardCloseOverlay()});
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+  let wasNarrow = narrow();
+  addEventListener('resize', () => { if (narrow() === wasNarrow) return; wasNarrow = narrow(); if (selected) paintList(); else { paint(); el('scroll').scrollTop = narrow() ? el('scroll').scrollHeight : 0; } });
   setInterval(() => { if (!document.hidden && !busy) load(); }, 60000);
   load();
 })();
