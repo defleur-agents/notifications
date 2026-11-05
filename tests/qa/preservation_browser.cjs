@@ -69,9 +69,10 @@ async function opaque(page, frame, label) {
       page.on('pageerror', e=>errors.push(String(e)));
       await context.route('**/*', route => {const u = new URL(route.request().url()); if (u.origin !== srv.origin && u.protocol !== 'data:') {external.push(u.origin+u.pathname); return route.abort();} return route.continue();});
       page.on('response', response => { if (response.status()===200 && /\.(js|css)(\?|$)/.test(response.url())) pending.push(response.body().then(b => {if (b.length) delivered.push({url:response.url().replace(srv.origin,''),sha256:hash(b)});})); });
+      let frame;
       try {
         await page.goto(srv.origin+'/fixture.html');
-        const frame = await page.locator('iframe').elementHandle().then(h=>h.contentFrame());
+        frame = await page.locator('iframe').elementHandle().then(h=>h.contentFrame());
         await frame.locator('.subject-row').first().waitFor();
         assert.equal(await frame.evaluate(()=>innerWidth), config.viewport.width);
         await page.waitForFunction(()=>WizAppearance.inspect().some(s=>s.acked));
@@ -123,6 +124,10 @@ async function opaque(page, frame, label) {
         await Promise.all(pending); assert.equal(errors.length,0,errors.join('\n')); assert.equal(external.length,0,external.join('\n'));
         assert(delivered.some(v=>v.url==='/wizard-os-home/core/app-client.js'));
         assert(delivered.some(v=>v.url==='/wizard-os-home/core/appearance-host.js'));
+      } catch (error) {
+        // Keep what the owner would have seen at the failing step (synthetic data only).
+        try { await page.screenshot({path: path.join(OUT, profile+'-failure.png')}); fs.writeFileSync(path.join(OUT, profile+'-failure-frame.html'), frame ? await frame.content() : await page.content()); } catch {}
+        throw error;
       } finally {await context.close(); await srv.stop();}
     }
     receipt.pass=true;
