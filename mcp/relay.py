@@ -1,3 +1,4 @@
+
 # ---- Scheduled-job relay: the agent's cron results become notifications ----
 # Reads the Hermes cron folder (mounted read-only at CRON_DIR) every few minutes and posts each new run to the
 # `cron` topic, so the inbox shows what scheduled jobs did without the agent spending a turn on it. Rules:
@@ -7,12 +8,21 @@
 # - dated outcomes are never merged (numbers and dates are kept), so each daily report is its own item;
 # - jobs listed in CRON_QUIET_JOBS (ids or names) never post a success (an app badge covers them); their
 #   failures still alert;
-# - the agent runtime's own self-check footer ("File-mutation verifier: ...") is never owner content: it is
-#   stripped, and a run that said [SILENT] stays silent whatever the runtime appended after it;
-# - CRON_FAILURES=off: an agent-side recovery lane owns failed runs (it repairs them and tells the owner only
-#   what it could not fix), so failures are not posted here; warning-sign alerts written for the owner still are;
 # - a post the server does not confirm is retried on the next pass; it never consumes the run.
 # The first pass on a box only looks back CRON_LOOKBACK_H hours, so installing never floods the inbox.
+#
+# Failures go to the agent, not the owner, once the box has a failure responder: a Hermes cron job named
+# CRON_RESPONDER (default "Failure responder", or its id). Then a failed run is not posted; it is kept in the open-
+# failures file (cron-failures.json beside the relay state) that the responder watches, fixes and acknowledges in
+# cron-failures-ack.json (written by the agent on the host: {"<job id>": <first_seen of the episode it handled>}). The next success of that job
+# closes it. Safety net: a failure still open and unacknowledged after CRON_ESCALATE_H hours posts once per episode,
+# and the responder's own runs always post (its failures included), so a broken responder is never silent.
+# CRON_FAILURES=owner forces the old behaviour (every failure posts); =agent forces routing even without a responder.
+#
+# Which app a job is about: CRON_JOB_APPS = "<job id or name>=<app id>, ..." tags that job's posts `app:<app id>`
+# (APP_TAG), so the inbox files them under that app (its name, its mark, its own Chats / Badge / Off choice) instead
+# of the agent's catch-all group. Unlisted jobs are the agent's own. A shell without that app installed shows them as
+# the agent's again, so naming an app that is not installed yet is harmless.
 import hashlib
 import re
 
@@ -23,41 +33,96 @@ CRON_EVERY = max(30, int(os.environ.get("CRON_EVERY_S", "300") or 300))
 CRON_LOOKBACK_H = float(os.environ.get("CRON_LOOKBACK_H", "24") or 24)
 CRON_QUIET = {x.strip().lower() for x in os.environ.get("CRON_QUIET_JOBS", "").split(",") if x.strip()}
 CRON_STATE = os.environ.get("CRON_STATE", os.path.join(os.path.dirname(STATE_FILE) or "/data", "cron-relay.json"))
+def _failure_mode():
+    """Explicit form choice wins; auto consults the preserved app-local choice before responder discovery."""
+    value = os.environ.get("CRON_FAILURES", "auto").strip().lower()
+    if value in ("", "auto", "default"):
+        try:
+            with open(os.path.join(os.path.dirname(CRON_STATE), "cron-relay-settings.json")) as f:
+                value = str(json.load(f).get("failures", "")).strip().lower() or value
+        except (OSError, ValueError, AttributeError):
+            pass
+    if value in ("off", "0", "false", "no"):
+        return "off"
+    if value in ("owner", "on", "1", "true"):
+        return "owner"
+    return "agent" if value == "agent" else "auto"
 
 
 def _failures_setting():
-    """True when failed runs post to the owner.
-
-    The box-local /data/cron-relay-settings.json {"failures": "off"} wins over the app form's default:
-    upstream compose ships CRON_FAILURES=auto, and on 31 Oct 2026 that default silently re-enabled
-    failure posts on a box whose agent-side recovery lane owns them (James: alerts go through the
-    agent first). Explicit form values still apply: owner/on posts, agent/off does not.
-    """
-    v = os.environ.get("CRON_FAILURES", "").strip().lower()
-    if v in ("", "auto", "default"):
-        try:
-            with open(os.path.join(os.path.dirname(CRON_STATE), "cron-relay-settings.json")) as f:
-                v = str(json.load(f).get("failures", "")).strip().lower() or v
-        except (OSError, ValueError, AttributeError):
-            pass
-    return v not in ("off", "0", "false", "no", "agent")
+    # Preserve the live helper's boolean interface; routing uses the full selection below.
+    return _failure_mode() not in ("off", "agent")
 
 
+CRON_FAILURE_MODE = _failure_mode()
 CRON_FAILURES = _failures_setting()
-# The agent runtime appends this self-check to a turn's text; it is diagnostics for the agent, not a result.
-_RUNTIME_FOOTER = re.compile(r"\n?[ \t]*(\u26a0\ufe0f?[ \t]*)?File-mutation verifier:[\s\S]*")
+CRON_RESPONDER = {x.strip().lower() for x in os.environ.get("CRON_RESPONDER", "Failure responder").split(",") if x.strip()}
+CRON_ESCALATE_H = float(os.environ.get("CRON_ESCALATE_H", "24") or 24)
+
+
+def _job_apps(raw):
+    out = {}
+    for part in str(raw or "").split(","):
+        job, _, app = part.partition("=")
+        job, app = job.strip().lower(), app.strip().lower()
+        if job and APP_ID_RX.fullmatch(app):
+            out[job] = app
+    return out
+
+
+CRON_JOB_APPS = _job_apps(os.environ.get("CRON_JOB_APPS", ""))
 _EOL = r"[ \t]*(?=\n|\Z)"   # end of line without a dollar sign (compose would interpolate one)
+_RUNTIME_FOOTER = re.compile(r"\n?[ \t]*(\u26a0\ufe0f?[ \t]*)?File-mutation verifier:[\s\S]*")
 _relay_lock = threading.Lock()
 
 
-def _job_names(cron_dir):
+def _jobs(cron_dir):
     try:
         with open(os.path.join(cron_dir, "jobs.json")) as f:
             d = json.load(f)
         jobs = d.get("jobs", d) if isinstance(d, dict) else d
-        return {j["id"]: j.get("name") or j["id"] for j in jobs}
+        return [j for j in jobs if isinstance(j, dict) and j.get("id")]
     except (OSError, ValueError, KeyError, TypeError):
-        return {}
+        return []
+
+
+def _job_names(cron_dir):
+    return {j["id"]: j.get("name") or j["id"] for j in _jobs(cron_dir)}
+
+
+def _app_tags(job, name):
+    app = CRON_JOB_APPS.get(str(job).lower()) or CRON_JOB_APPS.get(str(name).strip().lower())
+    return [APP_TAG + app] if app else []
+
+
+def _is_responder(job, name):
+    return job.lower() in CRON_RESPONDER or str(name).strip().lower() in CRON_RESPONDER
+
+
+def _route_to_agent(cron_dir):
+    """True when failures go to the agent's responder instead of the owner."""
+    if CRON_FAILURE_MODE in ("owner", "off"):
+        return False
+    if CRON_FAILURE_MODE == "agent":
+        return True
+    return any(_is_responder(j["id"], j.get("name") or "") and j.get("enabled", True) is not False
+               and j.get("state", "") != "paused" for j in _jobs(cron_dir))
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as f:
+            v = json.load(f)
+        return v if isinstance(v, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path, value):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
 
 
 def _section(text, name):
@@ -67,6 +132,21 @@ def _section(text, name):
     rest = text[m[-1].end():]
     nxt = re.search(r"^## |^\*\*Response Characters", rest, re.M)
     return (rest[:nxt.start()] if nxt and name != "Response" else rest).strip()
+
+
+_SILENT_LINE = re.compile(r"\[?\s*(SILENT|NO[_ ]REPLY)\s*\]?[.!]?", re.I)
+
+
+def cron_silent(body):
+    """Hermes' own rule for autonomous runs (gateway.response_filters.is_autonomous_silence_response): the marker as
+    the whole answer, on its own first or last line, or opening it as "[SILENT] ...". Agents often add a short note
+    before it ("Already logged.\n\n[SILENT]"); Hermes delivers nothing then, so neither may the inbox."""
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return True
+    if body.upper().startswith(("[SILENT]", "[NO_REPLY]", "[NO REPLY]")):
+        return True
+    return any(_SILENT_LINE.fullmatch(c) for c in (body.strip(), lines[0], lines[-1]))
 
 
 def cron_summarize(text):
@@ -84,14 +164,11 @@ def cron_summarize(text):
             parts = re.split(r"^---%s" % _EOL, text, maxsplit=1, flags=re.M)
             body = parts[1] if len(parts) > 1 else text.split(status, 1)[-1] if status else ""
     body = _RUNTIME_FOOTER.sub("", body).strip()
-    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    if not lines or any(x.upper().startswith(("[SILENT]",)) or x.upper() == "SILENT" for x in (lines[0], lines[-1])):
+    if not body or cron_silent(body):
         return None
-    # A short all-clear heartbeat ("meter snapshot ok") is a silent run, unless the job says it failed.
     if not failed and len(body) < 60 and re.search(r"\b(ok|healthy|nothing to report|no new activity)\b", body, re.I) and \
             not re.search(r"\b(fail\w*|error\w*|warn\w*|full|down)\b", body, re.I):
         return None
-    # A body that opens with a warning sign is an alert the owner needs, even when the job itself succeeded.
     if body.startswith(("\u26a0", "\U0001f6a8")):
         failed = True
     head = body[:240].lower()
@@ -137,6 +214,9 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
         quiet_days = st.get("quiet_days", {})
         since = float(st.get("since", 0))
         names = _job_names(cron_dir)
+        to_agent = _route_to_agent(cron_dir)
+        failures_path = os.path.join(os.path.dirname(state_path) or ".", "cron-failures.json")
+        open_f = _read_json(failures_path, {}) if to_agent else {}
         files = []
         for job in os.listdir(out_dir):
             d = os.path.join(out_dir, job)
@@ -167,21 +247,36 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
             if s is None:
                 if not re.search(r"^\*\*Status:\*\*[ \t]*(error|failed|blocked)", raw, re.M | re.I):
                     alerts.pop(job, None)
+                    open_f.pop(job, None)              # a clean run closes the agent's open failure
                 skipped += 1
                 done.add(key)
                 continue
             failed, body = s
-            if failed and not CRON_FAILURES and not body.startswith(("\u26a0", "\U0001f6a8")):
-                skipped += 1                       # the recovery lane owns it; the owner hears only its outcome
+            warning = body.startswith(("\u26a0", "\U0001f6a8"))
+            if failed and CRON_FAILURE_MODE == "off" and not warning:
+                skipped += 1                       # explicit Off: no responder queue or escalation
                 done.add(key)
                 continue
-            had_alert = job in alerts
+            name = names.get(job) or (re.search(r"^# Cron Job: (.+)", raw, re.M) or [0, job])[1]
+            had_alert = job in alerts or job in open_f
+            if to_agent and not _is_responder(job, name):
+                if failed:                             # the agent's job: queue it, tell the owner nothing
+                    o = open_f.get(job) or {"first_seen": mt, "runs": 0}
+                    o.update(name=str(name), body=body[:3800], last_seen=mt, runs=o.get("runs", 0) + 1,
+                             digest=hashlib.sha256(body.encode()).hexdigest()[:16])
+                    open_f[job] = o
+                    skipped += 1
+                    done.add(key)
+                    continue
+                open_f.pop(job, None)
+            responder = to_agent and _is_responder(job, name)
+            if responder:                              # it speaks only when the owner must act; its own crash is a failure
+                failed = bool(_section(raw, "Error")) or bool(re.search(r"^\*\*Status:\*\*[ \t]*(error|failed)", raw, re.M | re.I))
             suppress, receipt = cron_failure_policy(job, body, failed, alerts, mt)
             if suppress:
                 skipped += 1
                 done.add(key)
                 continue
-            name = names.get(job) or (re.search(r"^# Cron Job: (.+)", raw, re.M) or [0, job])[1]
             recovered = False
             if not failed and (job.lower() in CRON_QUIET or str(name).strip().lower() in CRON_QUIET):
                 if not had_alert:
@@ -189,13 +284,12 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
                     skipped += 1
                     done.add(key)
                     continue
-                recovered = True                   # a quiet job's first success after a failure closes its thread
+                recovered = True
             when = time.strftime("%d %b %H:%M UTC", time.gmtime(mt))
-            warning = body.startswith(("\u26a0", "\U0001f6a8"))
             prefix = "Recovered: " if recovered else "Failed: " if failed and not warning else ""
             try:
                 ok = post(prefix + str(name), "%s\n\n%s" % (body, when),
-                          4 if failed else 2, ["cron", "warning" if failed else "clock"])
+                          4 if failed or responder else 2, ["cron", "warning" if failed or responder else "clock"] + _app_tags(job, name))
             except OSError:
                 ok = False
             if not ok:
@@ -204,6 +298,9 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
             if receipt is not None:
                 alerts[job] = receipt
             sent += 1
+        if to_agent:
+            sent += _escalate(open_f, _read_json(os.path.join(os.path.dirname(state_path) or ".", "cron-failures-ack.json"), {}), post, now or time.time())
+            _write_json(failures_path, open_f)
         keep = sorted(k for k in done if os.path.exists(os.path.join(out_dir, k)))
         quiet_days = dict(sorted(quiet_days.items())[-60:])
         tmp = state_path + ".tmp"
@@ -211,6 +308,27 @@ def cron_relay_once(cron_dir=None, state_path=None, post=None, now=None):
             json.dump({"since": since, "done": keep, "failure_alerts": alerts, "quiet_days": quiet_days}, f)
         os.replace(tmp, state_path)
         return {"sent": sent, "skipped": skipped}
+
+
+def _escalate(open_f, ack, post, now):
+    """Safety net: one post per failure episode left open and unacknowledged for CRON_ESCALATE_H hours."""
+    sent = 0
+    for job, o in sorted(open_f.items()):
+        handled = ack.get(job)
+        if o.get("escalated") or (handled is not None and float(handled) >= float(o.get("first_seen", 0)) - 1):
+            continue
+        if now - float(o.get("first_seen", now)) < CRON_ESCALATE_H * 3600:
+            continue
+        hours = int((now - float(o["first_seen"])) // 3600)
+        msg = "Failing for %d hours and the agent has not fixed it yet. Latest:\n%s" % (hours, o.get("body", ""))
+        try:
+            ok = post("Still failing: " + o.get("name", job), msg, 4, ["cron", "warning"] + _app_tags(job, o.get("name", job)))
+        except OSError:
+            ok = False
+        if ok:
+            o["escalated"] = now
+            sent += 1
+    return sent
 
 
 def _cron_loop():

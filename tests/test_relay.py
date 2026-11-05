@@ -62,6 +62,18 @@ class RelayTests(unittest.TestCase):
         self.add("job1", "b.md", run_md(status="silent"), self.t0 + 1)
         self.assertEqual(self.run_once()["sent"], 0); self.assertEqual(self.posts, [])
 
+    def test_silent_marker_on_its_own_last_or_first_line_posts_nothing(self):
+        # Hermes delivers nothing for these (autonomous silence rule); they reached the inbox as unreadable badges.
+        for i, r in enumerate(("Already logged; the change is just Unread to Read.\n\n[SILENT]",
+                               "Both already logged; watcher recovered.\n\n[SILENT]",
+                               "[SILENT]\nNothing new.", "[SILENT] no changes", "silent")):
+            self.add("job1", f"s{i}.md", run_md(response=r), self.t0 + i)
+        self.assertEqual(self.run_once()["sent"], 0); self.assertEqual(self.posts, [])
+
+    def test_marker_mid_sentence_still_posts(self):
+        self.add("job1", "m.md", run_md(response="Buyer asked whether to stay [SILENT] on price; reply drafted."), self.t0)
+        self.assertEqual(self.run_once()["sent"], 1)
+
     def test_same_failure_quiet_for_a_day_then_reminds(self):
         self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
         self.add("job1", "2.md", run_md(status="error", error="disk full"), self.t0 + 600)
@@ -119,6 +131,124 @@ class RelayTests(unittest.TestCase):
         p = self.add("job1", "1.md", run_md(response="done"), self.t0)
         Path(self.state).write_text(json.dumps({"since": self.t0 - 10, "done": ["job1/1.md"], "failure_alerts": {}}))
         self.assertEqual(self.run_once()["sent"], 0)
+
+    # ---- failures go to the agent's responder ----
+    def responder_box(self):
+        (self.cron / "jobs.json").write_text(json.dumps({"jobs": [
+            {"id": "job1", "name": "Backup check"}, {"id": "morning", "name": "Morning briefing"},
+            {"id": "resp", "name": "Failure responder", "enabled": True}]}))
+
+    def openf(self):
+        p = self.root / "cron-failures.json"
+        return json.loads(p.read_text()) if p.exists() else {}
+
+    def test_without_responder_failures_still_post(self):
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
+        self.run_once(); self.assertEqual(self.posts[0][0], "Failed: Backup check")
+        self.assertFalse((self.root / "cron-failures.json").exists())
+
+    def test_with_responder_failures_are_queued_not_posted(self):
+        self.responder_box()
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
+        self.add("job1", "2.md", run_md(response="Standby has not synced for 8 hours (last error: low disk)"), self.t0 + 60)
+        self.add("job1", "3.md", run_md(response="Failed again: standby 10 hours"), self.t0 + 120)
+        self.run_once()
+        self.assertEqual(self.posts, [])
+        o = self.openf()["job1"]; self.assertEqual(o["runs"], 3); self.assertIn("10 hours", o["body"])
+        self.assertEqual(o["first_seen"], self.t0)
+
+    def test_success_closes_the_open_failure_and_still_posts_success(self):
+        self.responder_box()
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
+        self.run_once(); self.assertIn("job1", self.openf())
+        self.add("job1", "2.md", run_md(response="All 3 backups fresh."), self.t0 + 60)
+        self.run_once(now=self.t0 + 200)
+        self.assertNotIn("job1", self.openf()); self.assertEqual([p[0] for p in self.posts], ["Backup check"])
+
+    def test_silent_success_closes_too(self):
+        self.responder_box()
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
+        self.add("job1", "2.md", run_md(response="[SILENT]"), self.t0 + 60)
+        self.run_once(); self.assertEqual(self.openf(), {}); self.assertEqual(self.posts, [])
+
+    def test_responder_output_and_failures_always_post(self):
+        self.responder_box()
+        self.add("resp", "1.md", run_md(response="Needs you: add Codex credits. Failed to fix."), self.t0)
+        self.add("resp", "2.md", run_md(status="error", error="provider down"), self.t0 + 60)
+        self.run_once()
+        self.assertEqual([(p[0], p[2]) for p in self.posts], [("Failure responder", 4), ("Failed: Failure responder", 4)])
+        self.assertEqual(self.openf(), {})
+
+    def test_escalates_once_after_a_day_unless_acknowledged(self):
+        self.responder_box()
+        t = time.time() - 30 * 3600
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), t)
+        self.run_once(now=t + 3600); self.assertEqual(self.posts, [])
+        self.run_once(now=t + 25 * 3600)
+        self.assertEqual(len(self.posts), 1); self.assertTrue(self.posts[0][0].startswith("Still failing: Backup check"))
+        self.run_once(now=t + 50 * 3600); self.assertEqual(len(self.posts), 1)   # once per episode
+
+    def test_acknowledged_failure_never_escalates(self):
+        self.responder_box()
+        t = time.time() - 30 * 3600
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), t)
+        self.run_once(now=t + 3600)
+        (self.root / "cron-failures-ack.json").write_text(json.dumps({"job1": t}))
+        self.run_once(now=t + 25 * 3600); self.assertEqual(self.posts, [])
+
+    def test_owner_mode_overrides_responder(self):
+        self.responder_box(); ns = load({"CRON_FAILURES": "owner"})
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
+        ns["cron_relay_once"](str(self.cron), self.state, self.post, time.time())
+        self.assertEqual(self.posts[0][0], "Failed: Backup check")
+
+    def test_paused_responder_means_owner_gets_failures(self):
+        (self.cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "job1", "name": "Backup check"},
+                                                                  {"id": "resp", "name": "Failure responder", "enabled": False}]}))
+        self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
+        self.run_once(); self.assertEqual(self.posts[0][0], "Failed: Backup check")
+
+    def test_job_apps_tag_posts_with_their_app(self):
+        ns = load({"CRON_JOB_APPS": "job1=backup, Morning briefing = morning-report, bad=Not An Id"})
+        self.assertEqual(ns["CRON_JOB_APPS"], {"job1": "backup", "morning briefing": "morning-report"})
+        self.add("job1", "2026-10-24_01-00-00.md", run_md(response="All 3 backups fresh."), self.t0)
+        self.add("other", "2026-10-24_01-00-00.md", run_md(response="Something of the agent's own."), self.t0)
+        self.add("morning", "2026-10-24_02-00-00.md", run_md(status="failed", error="boom"), self.t0)
+        ns["cron_relay_once"](str(self.cron), self.state, self.post, time.time())
+        tags = {p[0]: p[3] for p in self.posts}
+        self.assertEqual(tags["Backup check"], ["cron", "clock", "app:backup"])
+        self.assertEqual(tags["Demo"], ["cron", "clock"])                       # unlisted: the agent's own
+        self.assertEqual(tags["Failed: Morning briefing"], ["cron", "warning", "app:morning-report"])  # by name
+
+    def test_escalation_keeps_the_app_tag(self):
+        ns = load({"CRON_JOB_APPS": "job1=backup", "CRON_FAILURES": "agent"})
+        now = time.time()
+        self.add("job1", "2026-10-24_01-00-00.md", run_md(status="failed", error="disk full"), now - 3600 * 30)
+        st = self.root / "state.json"; st.write_text(json.dumps({"since": now - 3600 * 40, "done": []}))
+        ns["cron_relay_once"](str(self.cron), self.state, self.post, now)
+        self.assertEqual([p[0] for p in self.posts], ["Still failing: Backup check"])
+        self.assertIn("app:backup", self.posts[0][3])
+
+    def test_item_app_and_route(self):
+        ns = self.ns
+        self.assertEqual(ns["item_app"](["cron", "app:sniper"]), "sniper")
+        self.assertEqual(ns["item_app"](["app:Bad Id", "cron"]), "")
+        self.assertEqual(ns["item_route_id"]({"tags": ["cron", "app:sniper"], "priority": 2}), "sniper")
+        # needs you: follows Notifications' own choice, like System notices do
+        self.assertEqual(ns["item_route_id"]({"tags": ["cron", "app:sniper"], "priority": 4}), "notifications")
+        self.assertEqual(ns["item_route_id"]({"tags": ["cron"], "priority": 2}), "notifications")
+
+    def test_notify_app_param_tags_the_post(self):
+        ns = self.ns; sent = []
+        ns["REQUEST"].set({})
+        # App attribution is carried into the existing editor admission, never sent raw around it.
+        ns["rewrite_and_deliver"] = lambda payload: sent.append(payload) or {"id": "x"}
+        ns["notify"]("Aree replied", title="Aree", app="second-hand", tags="wave,app:spoof")
+        self.assertEqual(sent[-1]["tags"], ["wave", "app:second-hand"])
+        ns["notify"]("plain")
+        self.assertNotIn("tags", sent[-1])
+        with self.assertRaises(ValueError):
+            ns["notify"]("x", app="../etc")
 
     def test_compose_is_generated_and_has_no_dollar_in_front(self):
         self.assertNotIn("$", (ROOT / "mcp" / "relay.py").read_text())

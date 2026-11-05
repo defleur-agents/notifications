@@ -4,6 +4,20 @@
 # their phone at it.
 
 TOPIC = os.environ.get("NOTIFY_TOPIC", "wizard")
+# A notification about one app carries the tag `app:<app id>`: the inbox files it under that app (its name, mark and
+# Chats / Badge / Off choice) instead of the agent's own group. Untagged = the agent's own.
+import re as _re
+APP_TAG = "app:"
+APP_ID_RX = _re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+
+def item_app(tags):
+    """The app a notification is about (its `app:<id>` tag), or ''."""
+    for t in tags or []:
+        t = str(t)
+        if t.startswith(APP_TAG) and APP_ID_RX.fullmatch(t[len(APP_TAG):]):
+            return t[len(APP_TAG):]
+    return ""
 PRIORITIES = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
 
 
@@ -26,9 +40,11 @@ def _clean(text, limit):
        "title": {"type": "string", "description": "Short title, e.g. 'Video ready' (optional)"},
        "priority": {"type": "string", "enum": list(PRIORITIES), "description": "default unless it is urgent"},
        "link": {"type": "string", "description": "https link to open when tapped (optional)"},
-       "tags": {"type": "string", "description": "Comma-separated emoji short codes, e.g. 'white_check_mark' (optional)"}},
+       "tags": {"type": "string", "description": "Comma-separated emoji short codes, e.g. 'white_check_mark' (optional)"},
+       "app": {"type": "string", "description": "Id of the installed app this is about, e.g. 'sniper' (optional): it is "
+               "then listed under that app and follows that app's notification choice; leave empty for your own"}},
       ["message"])
-def notify(message, title="", priority="default", link="", tags=""):
+def notify(message, title="", priority="default", link="", tags="", app=""):
     _box_only()
     body = str(message or "").strip()
     if not body:
@@ -42,7 +58,12 @@ def notify(message, title="", priority="default", link="", tags=""):
             raise ValueError("link must be an https:// address")
         payload["click"] = url[:2000]
     if tags:
-        payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t][:5]
+        payload["tags"] = [t for t in (_clean(x, 40) for x in str(tags).split(",")) if t and not t.startswith(APP_TAG)][:5]
+    app = str(app or "").strip().lower()
+    if app:
+        if not APP_ID_RX.fullmatch(app):
+            raise ValueError("app is an app id like 'sniper'")
+        payload["tags"] = payload.get("tags", []) + [APP_TAG + app]
     return rewrite_and_deliver(payload)
 
 
@@ -73,6 +94,7 @@ def notifications_recent(since="24h", limit=20):
 # ---- Inbox: the owner's view of everything sent here, with read / flag / archive ----
 # The page and its API live on this front at /notifications/ (the Wizard shell opens it at the same path on its own
 # origin). ntfy keeps the messages (30 days); this keeps only the owner's marks, in a small JSON file.
+import tempfile
 import threading
 import hashlib
 import re
@@ -121,7 +143,7 @@ def _poll(topic, since):
             m = json.loads(line)
         except ValueError:
             continue
-        if m.get("error") and not m.get("event"):    # ntfy can report a limit inside a 200 stream
+        if (m.get("error") or m.get("http")) and not m.get("event"):    # a partial poll is never a full refresh
             raise RuntimeError("notification server: %s" % m.get("error"))
         if m.get("event") == "message":
             out.append(m)
@@ -165,6 +187,7 @@ def _messages(since="all"):
             item["details"] = details[item["id"]]
         if item["id"] in thread_titles:
             item["thread_title"] = thread_titles[item["id"]]
+
     out.sort(key=lambda m: m.get("time", 0), reverse=True)
     return out
 
@@ -211,12 +234,14 @@ def _threads(items):
             g = groups[key] = dict(it, id=_thread_id(key), runs=[])
             out.append(g)
         run = {k: it[k] for k in ("id", "time", "title", "message", "priority", "read", "flag", "archived")}
+        run["details"] = it.get("details", "")
         run["run_time"] = _run_time(it)
         g["runs"].append(run)
     for key, g in groups.items():
         g["runs"].sort(key=lambda r: -r["run_time"])
         head = next(i for i in items if i["id"] == g["runs"][0]["id"])
         g.update({k: head[k] for k in ("time", "title", "message", "link", "tags")})
+        g["details"] = head.get("details", "")
         runs = g["runs"]
         unread = [r for r in runs if not r["read"]]
         g["read"] = not unread
@@ -238,6 +263,7 @@ def inbox_items(view="inbox", limit=200, threads=True):
         it = {"id": m["id"], "time": m.get("time", 0), "title": m.get("title", ""), "message": m.get("message", ""), "details": m.get("details", ""), "thread_title": m.get("thread_title", m.get("title", "")),
               "priority": m.get("priority", 3), "link": m.get("click", ""), "tags": tags,
               "source": "cron" if "cron" in tags else "agent",
+              **({"from": item_app(tags)} if item_app(tags) else {}),
               "read": bool(s.get("read")), "flag": bool(s.get("flag")), "archived": bool(s.get("archived"))}
         items.append(it)
     group = _threads if threads else (lambda xs: xs)
@@ -277,12 +303,51 @@ def _expand_ids(ids, marks):
     return out
 
 
-def inbox_mark(ids, **marks):
-    ids = [str(i)[:40] for i in (ids or [])][:500]
+APP_ID = "a-"          # app inbox feed items (Wizard OS inbox feed v1): "a-<app id>-<key hash>", kept by the shell
+APP_KEEP = 60 * 86400   # an app item's mark outlives ntfy's 30 days; dropped 60 days after the activity it covers
+
+
+def _app_id(i):
+    return isinstance(i, str) and i.startswith(APP_ID) and 3 < len(i) <= 128 and all(c.isalnum() or c in "-_" for c in i)
+
+
+MARK_GONE_GRACE = 3 * 86400   # a notification mark is forgotten only after ntfy has stopped listing it for 3 days
+
+
+def _prune_marks(st, now):
+    """Forget marks for messages ntfy has expired. Never on a partial or failed read: one bad poll must not wipe
+    the owner's read/archived state (that brought weeks of old items back as unread)."""
+    try:
+        live = {m["id"] for m in _messages()}
+    except Exception:
+        return st
+    out = {}
+    for k, v in st.items():
+        if _app_id(k):
+            if now - float(v.get("at") or 0) < APP_KEEP:
+                out[k] = v
+        elif k in live:
+            v.pop("gone", None)
+            out[k] = v
+        else:
+            try:
+                gone = float(v.get("gone") or now)
+            except (TypeError, ValueError):
+                gone = now
+            if now - gone < MARK_GONE_GRACE:
+                v["gone"] = gone
+                out[k] = v
+    return out
+
+
+def inbox_mark(ids, at=None, **marks):
+    ids = [str(i)[:128] if _app_id(str(i)) else str(i)[:40] for i in (ids or [])][:500]
     keep = {k: bool(v) for k, v in marks.items() if k in ("read", "flag", "archived") and v is not None}
     if not ids or not keep:
         raise ValueError("give ids and at least one of read, flag, archived")
     ids = _expand_ids(ids, keep)[:2000]
+    at = at if isinstance(at, dict) else {}
+    now = time.time()
     with _lock:
         st = _load_state()
         for i in ids:
@@ -290,11 +355,263 @@ def inbox_mark(ids, **marks):
             cur.update(keep)
             if keep.get("archived"):
                 cur["read"] = True
+            if _app_id(i):
+                # The mark covers the item as it was (its latest activity): newer activity in the app brings it back.
+                try:
+                    cur["at"] = max(0, min(float(at.get(i, now)), now + 60))
+                except (TypeError, ValueError):
+                    cur["at"] = now
             st[i] = cur
-        live = {m["id"] for m in _messages()}   # forget marks for messages ntfy has expired
-        st = {k: v for k, v in st.items() if k in live}
+        st = _prune_marks(st, now)
         _save_state(st)
     return {"ok": True, "changed": len(ids)}
+
+
+def app_marks():
+    st = _load_state()
+    return {"marks": {k: {"read": bool(v.get("read")), "archived": bool(v.get("archived")), "at": float(v.get("at") or 0)}
+                      for k, v in st.items() if _app_id(k)}}
+
+
+# ---- Inbox sources: per app, whether its "needs you" items show in the Chats inbox (and, later, on the phone) ----
+# One small JSON file beside the marks (never inside inbox.json: marks pruning would drop it). An app that is not
+# listed shows in Chats (chats: true). "phone" is reserved for phone notifications; nothing reads it yet.
+SOURCES_FILE = os.environ.get("INBOX_SOURCES", os.path.join(os.path.dirname(STATE_FILE) or ".", "sources.json"))
+SOURCES_MAX_APPS = 200
+SOURCES_MAX_BODY = 4096
+_SOURCE_FLAGS = ("chats", "phone")
+
+
+def _source_app(a):
+    return isinstance(a, str) and 0 < len(a) <= 64 and a[0].isalnum() and all(c.islower() or c.isdigit() or c == "-" for c in a)
+
+
+def _clean_sources(d):
+    out = {}
+    if isinstance(d, dict):
+        for app, v in d.items():
+            if _source_app(app) and isinstance(v, dict):
+                out[app] = {k: bool(v.get(k, True)) for k in _SOURCE_FLAGS}
+            if len(out) >= SOURCES_MAX_APPS:
+                break
+    return out
+
+
+def inbox_sources():
+    try:
+        with open(SOURCES_FILE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    return {"sources": _clean_sources(d.get("sources") if isinstance(d, dict) else None)}
+
+
+def set_inbox_source(app, chats=None, phone=None):
+    if not _source_app(app):
+        raise ValueError("give an app id")
+    patch = {k: v for k, v in (("chats", chats), ("phone", phone)) if v is not None}
+    if not patch or any(not isinstance(v, bool) for v in patch.values()):
+        raise ValueError("give chats and/or phone as true or false")
+    with _lock:
+        cur = inbox_sources()["sources"]
+        if app not in cur and len(cur) >= SOURCES_MAX_APPS:
+            raise ValueError("too many apps")
+        cur[app] = {**{k: True for k in _SOURCE_FLAGS}, **cur.get(app, {}), **patch}
+        # Atomic: a temp file in the same folder, flushed to disk, then renamed over the old one.
+        folder = os.path.dirname(SOURCES_FILE) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".sources-", suffix=".tmp", dir=folder)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"sources": cur}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o666)
+            os.replace(tmp, SOURCES_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    return {"ok": True, "sources": cur}
+
+
+# ---- Routes: where each source's notifications go, ONE place each (Miguel, 2 Nov 2026) ----
+# Chats (a thread that waits), Badge (a count on its icon), Morning report ("daily": one line in tomorrow's report) or Off (only
+# this app's history). Stored on the box, so every device shows the same choice. Sources: an app id, "notifications"
+# (the agent's own alerts) or "system:<kind>" for notices about Wizard itself. Daily is for System only: an app's own
+# items (Mail, Messenger) would lose their point if they waited a day. The agent's own alerts (about no app) only ever
+# wait in Chats (Miguel, 5 Nov 2026): no Badge, Daily or Off, so the owner fixes their cause or gives the noise an app.
+ROUTES_FILE = os.environ.get("INBOX_ROUTES", os.path.join(os.path.dirname(STATE_FILE) or ".", "routes.json"))
+ROUTE_TO = ("chats", "badge", "daily", "off")
+SYSTEM_KINDS = {
+    "app-updates": ("App updates", r"(\d+ apps? updated|App updates need a look)"),
+    "connections": ("App connections", r"(App connection added|Connection needs your OK)"),
+    "wizard-updates": ("Wizard updates", r"(App Manager updated|Wizard OS updated|Your release needs you to finish an update)"),
+}
+ROUTE_DEFAULTS = {"notifications": "chats", **{"system:" + k: "daily" for k in SYSTEM_KINDS}}
+ROUTES_MAX = 300
+ROUTE_HOOKS = []   # fn(changes) after a saved change (the phone router takes an app's notifications away)
+# What a source is called (the Morning Report's Overnight lines use these, so its picker knows which line is which).
+ROUTE_NAMES = {"notifications": "Notifications", **{"system:" + k: v[0] for k, v in SYSTEM_KINDS.items()}}
+
+
+# Morning Report sections (format wizard.report-section/1): "report:<section id>", e.g. report:wizard-health or
+# report:wizard-calendar.today. A section lives in the Morning report (default) or is Off; Chats and Badge are refused
+# until an app can send its section on its own, so a section is never lost between places.
+REPORT_TO = ("daily", "off")
+REPORT_ROUTES = {"prefix": "report:", "default": "daily", "allowed": list(REPORT_TO)}
+
+
+def _report_id(i):
+    import re
+    return isinstance(i, str) and bool(re.fullmatch(r"report:[a-z0-9][a-z0-9-]{0,47}(\.[a-z0-9][a-z0-9-]{0,31})?", i))
+
+
+def _route_id(i):
+    if not isinstance(i, str):
+        return False
+    if i.startswith("system:"):
+        return i[7:] in SYSTEM_KINDS
+    if i.startswith("report:"):
+        return _report_id(i)
+    return _source_app(i)
+
+
+def _daily_ok(i):
+    return i == "notifications" or i.startswith("system:") or _report_id(i)
+
+
+CHATS_ONLY = ("notifications",)
+CHATS_ONLY_MSG = "The agent's own notifications always wait in Chats"
+
+
+def _route_ok(k, v):
+    if k in CHATS_ONLY:
+        return v == "chats"
+    if v not in ROUTE_TO or (v == "daily" and not _daily_ok(k)):
+        return False
+    return v in REPORT_TO if k.startswith("report:") else True
+
+
+def _clean_routes(d):
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if _route_id(k) and _route_ok(k, v):
+                out[k] = v
+            if len(out) >= ROUTES_MAX:
+                break
+    return out
+
+
+def inbox_routes():
+    try:
+        with open(ROUTES_FILE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    raw = d.get("routes") if isinstance(d, dict) else None
+    saved = _clean_routes(raw)
+    for k in CHATS_ONLY:   # an old saved Badge/Daily/Off for them reads as Chats
+        if isinstance(raw, dict) and k in raw:
+            saved[k] = "chats"
+    return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "names": ROUTE_NAMES, "report": REPORT_ROUTES,
+            "saved": bool(saved) or bool(isinstance(d, dict) and d.get("saved"))}
+
+
+def set_inbox_routes(changes):
+    """changes: {source id: chats|badge|daily|off}. Unknown ids, values or a Daily an app can't take are refused."""
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("give routes as {source: chats|badge|daily|off}")
+    for k, v in changes.items():
+        if not _route_id(k):
+            raise ValueError("unknown source: %s" % str(k)[:70])
+        if v not in ROUTE_TO:
+            raise ValueError("route must be chats, badge, daily or off")
+        if k in CHATS_ONLY and v != "chats":
+            raise ValueError(CHATS_ONLY_MSG)
+        if v == "daily" and not _daily_ok(k):
+            raise ValueError("%s can't wait for the morning report" % k)
+        if k.startswith("report:") and v not in REPORT_TO:
+            raise ValueError("a report section is in the Morning report or Off")
+    with _lock:
+        cur = inbox_routes()["routes"]
+        cur.update(changes)
+        if len(cur) > ROUTES_MAX:
+            raise ValueError("too many sources")
+        folder = os.path.dirname(ROUTES_FILE) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".routes-", suffix=".tmp", dir=folder)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({"routes": cur, "saved": True}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o666)
+            os.replace(tmp, ROUTES_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    for hook in ROUTE_HOOKS:
+        try:
+            hook(changes)
+        except Exception as e:   # the choice is saved; a hook never undoes it
+            print("route hook error: %s: %s" % (type(e).__name__, e), flush=True)
+    return {"ok": True, "routes": cur, "defaults": dict(ROUTE_DEFAULTS), "saved": True}
+
+
+def system_kind(it):
+    """Which System kind an item is: its sender's tags (wizard-system + kind), else its known title. None if not System."""
+    import re
+    tags = [str(t) for t in (it.get("tags") or [])]
+    if "wizard-system" in tags:
+        for k in SYSTEM_KINDS:
+            if k in tags:
+                return k
+    title = str(it.get("title") or "").strip()
+    for k, (_, rx) in SYSTEM_KINDS.items():
+        if re.fullmatch(rx, title, re.I):
+            return k
+    return None
+
+
+def needs_you(it):
+    import re
+    return "needs-you" in (it.get("tags") or []) or int(it.get("priority") or 3) >= 4 or \
+        bool(re.search(r"need(s)? (a look|your OK|you)", str(it.get("title") or ""), re.I))
+
+
+def item_route_id(it):
+    app = item_app(it.get("tags"))
+    if app and not needs_you(it):
+        return app
+    k = system_kind(it)
+    return "system:" + k if k and not needs_you(it) else "notifications"
+
+
+def daily_items(hours=24, now=None):
+    """What waits for the Morning Report: items of the last `hours` whose source is set to Daily, grouped by source.
+    Something that needs the owner is never here (it follows Notifications' own choice)."""
+    now = now or time.time()
+    try:
+        hours = max(1, min(int(hours), 72))
+    except (TypeError, ValueError):
+        hours = 24
+    r = inbox_routes()
+    routes = {**r["defaults"], **r["routes"]}
+    groups = {}
+    for it in inbox_items("all", 500)["items"]:
+        if now - float(it.get("time") or 0) > hours * 3600:
+            continue
+        rid = item_route_id(it)
+        if routes.get(rid) != "daily":
+            continue
+        g = groups.setdefault(rid, {"source": rid, "name": SYSTEM_KINDS[rid[7:]][0] if rid.startswith("system:") else "Notifications", "items": []})
+        g["items"].append({"id": it["id"], "time": it["time"], "title": it["title"], "message": it["message"][:500]})
+    return {"hours": hours, "groups": list(groups.values())}
 
 
 @tool("notifications_inbox", "Read the owner's notification inbox (agent notes and scheduled-job results) with what they "
@@ -385,7 +702,8 @@ def inbox_route(method, path, query, headers, body):
     sub = path[len(INBOX):] if path.startswith(INBOX) else ""
     q = urllib.parse.parse_qs(query)
     if method == "GET" and sub in ("", "index.html"):
-        html = MINIMAL_HTML if (q.get("layout") or [""])[0] == "minimal" or LAYOUT == "cards" else PAGE_HTML.replace('<script defer', '<script src="layout.js"></script><script defer')
+        layout = (q.get("layout") or [LAYOUT])[0]
+        html = MINIMAL_HTML if layout in ("minimal", "cards") else PAGE_HTML.replace('<script defer', '<script src="layout.js"></script><script defer')
         return 200, "text/html; charset=utf-8", html.encode()
     if method == "GET" and sub in MINIMAL_ASSETS:
         mime, content = MINIMAL_ASSETS[sub]
@@ -403,7 +721,45 @@ def inbox_route(method, path, query, headers, body):
         if not headers.get("content-type", "").startswith("application/json"):
             return _json(415, {"error": "send application/json"})
         d = json.loads(body or b"{}")
-        return _json(200, inbox_mark(d.get("ids"), read=d.get("read"), flag=d.get("flag"), archived=d.get("archived")))
+        return _json(200, inbox_mark(d.get("ids"), at=d.get("at"), read=d.get("read"), flag=d.get("flag"), archived=d.get("archived")))
+    if method == "GET" and sub == "api/marks":
+        return _json(200, app_marks())
+    if method == "GET" and sub == "api/sources":
+        return _json(200, inbox_sources())
+    if method == "POST" and sub == "api/sources":
+        # JSON only and small: { "app": "<id>", "chats": true|false, "phone": true|false }.
+        if not headers.get("content-type", "").startswith("application/json"):
+            return _json(415, {"error": "send application/json"})
+        if len(body or b"") > SOURCES_MAX_BODY:
+            return _json(413, {"error": "request too large"})
+        try:
+            d = json.loads(body or b"{}")
+        except ValueError:
+            return _json(400, {"error": "bad json"})
+        if not isinstance(d, dict):
+            return _json(400, {"error": "send an object"})
+        try:
+            return _json(200, set_inbox_source(d.get("app"), chats=d.get("chats"), phone=d.get("phone")))
+        except ValueError as e:
+            return _json(400, {"error": str(e)})
+    if method == "GET" and sub == "api/routes":
+        return _json(200, inbox_routes())
+    if method == "POST" and sub == "api/routes":
+        # JSON only and small: { "routes": { "<source>": "chats"|"badge"|"daily"|"off" } }.
+        if not headers.get("content-type", "").startswith("application/json"):
+            return _json(415, {"error": "send application/json"})
+        if len(body or b"") > SOURCES_MAX_BODY * 4:
+            return _json(413, {"error": "request too large"})
+        try:
+            d = json.loads(body or b"{}")
+        except ValueError:
+            return _json(400, {"error": "bad json"})
+        try:
+            return _json(200, set_inbox_routes(d.get("routes") if isinstance(d, dict) else None))
+        except ValueError as e:
+            return _json(400, {"error": str(e)})
+    if method == "GET" and sub == "api/daily":
+        return _json(200, daily_items((q.get("hours") or [24])[0]))
     if method == "GET" and sub.startswith("media/"):
         # /notifications/media/<absolute path>: the path keeps its image extension so the shell's viewer opens it.
         return media_file("/" + urllib.parse.unquote(sub[len("media/"):]))

@@ -2,7 +2,10 @@
 (() => {
   const el = id => document.getElementById(id);
   const R = window.NotifRender;
-  let filter = 'unread', items = [], selected = null, generation = 0, busy = false, allReadArmed = false, listTop = 0;
+  let filter = 'unread', items = [], selected = null, generation = 0, busy = false, allReadArmed = false, listTop = 0, listGap = 0;
+  /* Thumb-first on narrow windows (Chats, Messenger): newest at the bottom, opened scrolled there. Wide windows read top-down. */
+  const narrow = () => innerWidth < 700;
+  const MORE = {flagged: 'Flagged', archive: 'Archive'};
   const titleOf = it => String(it.title || String(it.message || '').split('\n')[0] || 'Untitled notification');
   const say = text => { el('status').textContent = text || ''; };
   const disarmAllRead = () => { allReadArmed = false; el('allread').textContent = 'Mark all read'; };
@@ -25,19 +28,27 @@
   function visible() { return filter === 'unread' ? items.filter(it => !it.read) : items; }
   function paint() {
     if (strip.busy()) { strip.dirty = true; return; }
-    el('list').replaceChildren(...visible().map(it => {
+    const sc = el('scroll'), atEnd = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 4, rows = visible();
+    document.documentElement.classList.toggle('nt-up', narrow());
+    el('list').replaceChildren(...(narrow() ? rows.slice().reverse() : rows).map(it => {
       const li = node('li'), button = node('button', null, 'subject-row' + (it.read ? '' : ' unread'));
       button.type = 'button'; button.dataset.id = it.id;
-      button.setAttribute('aria-label', titleOf(it) + (it.read ? '' : ', unread'));
+      const when = R.shortTime(it.time);
+      button.setAttribute('aria-label', titleOf(it) + (it.read ? '' : ', unread') + (when ? ', ' + when : ''));
       const dot = node('span', '', 'dot'); dot.setAttribute('aria-hidden', 'true');
       button.append(dot, node('span', titleOf(it), 'title'));
       // A scheduled job's runs share one row; the count says how many are in it.
       if (it.runs && it.runs.length > 1) { const n = node('span', String(it.runs.length), 'runs'); n.setAttribute('aria-label', it.runs.length + ' runs'); button.append(n); }
-      li.append(button); return li;
+      const time = node('span', when, 'when'); time.setAttribute('aria-hidden', 'true');
+      button.append(time); li.append(button); return li;
     }));
+    // Narrow: stay on the newest row when it was in view; never move the list while the owner reads further up.
+    if (narrow() && !selected && atEnd) sc.scrollTop = sc.scrollHeight;
     el('empty').hidden = visible().length !== 0;
     el('empty').textContent = filter === 'unread' ? 'No unread notifications' : filter === 'flagged' ? 'No flagged notifications' : filter === 'archive' ? 'No archived notifications' : 'No notifications';
     document.querySelectorAll('[data-filter]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.filter === filter)));
+    // More names the view it holds (Flagged, Archive), so the owner always sees where he is.
+    el('more').textContent = MORE[filter] || 'More'; el('more').classList.toggle('on', !!MORE[filter]);
     el('overview').hidden = !!selected; el('detail').hidden = !selected;
     // The detail is one quiet page: no filter bar under it.
     el('toolbar').hidden = !!selected; document.documentElement.classList.toggle('nt-detail', !!selected);
@@ -51,7 +62,7 @@
    * these touches; the gesture lives here. The list next to the detail is an inert copy of the real list. */
   const strip = (() => {
     const LOCK = 10, RATIO = 1.3, GO = 70, VGO = 0.45, MS = 240, EASE = 'cubic-bezier(.2,.8,.2,1)', EDGE = 24;
-    const OURS = new Set(['obsidian', 'obsidian-light', 'landscapes']);
+    const OURS = new Set(['obsidian', 'obsidian-light', 'landscapes', 'landscapes-light']);
     const app = document.querySelector('.wz-app');
     let G = null, ghost = null, anims = [], blockClick = 0;
     const api = {dirty: false};
@@ -75,7 +86,7 @@
     };
     function mount(g) {
       ghost = g; document.documentElement.classList.add('nt-sliding'); document.body.append(g);
-      const sc = g.querySelector('.wz-scroll'); if (sc) sc.scrollTop = listTop;
+      const sc = g.querySelector('.wz-scroll'); if (sc) sc.scrollTop = narrow() ? sc.scrollHeight - sc.clientHeight - listGap : listTop;
     }
     function done() {
       anims.forEach(a => a.cancel()); anims = [];
@@ -200,6 +211,7 @@
       s.append(node('span', R.friendlyTime(runTime(r)), 'when'), node('span', failed ? 'Failed' : /^Recovered: /.test(r.title || '') ? 'Recovered' : 'Done', failed ? 'state bad' : 'state'));
       const body = node('p', String(r.message || '').trim().replace(/\n+\d{1,2} \w{3} \d{2}:\d{2} UTC(?![\s\S])/, ''), 'run-body');
       d.append(s, body); li.append(d); list.append(li);
+      if (r.details) { const raw = node('details'), pre = node('pre', r.details, 'run-body'); raw.append(node('summary', 'Details'), pre); d.append(raw); }
     }
     box.replaceChildren(node('h3', 'Earlier runs'), list);
   }
@@ -212,6 +224,8 @@
     const b = node('button', null, cls || 'act'); b.type = 'button'; b.disabled = busy; b.onclick = handler;
     if (iconName) b.append(icon(iconName)); b.append(node('span', label)); return b;
   }
+  /* Reply needs a Wizard that can open a Chats draft; on an older Wizard it is simply not offered. */
+  const canReply = () => typeof window.WizardApp?.nav?.openContextDraft === 'function';
   function startChat(it) {
     try {
       const receipt = window.WizardApp.nav.openContextDraft({id: String(it.id), title: titleOf(it), message: String(it.message || '')});
@@ -238,53 +252,61 @@
     if (link) {
       const a = node('a', null, 'btn-primary'); a.href = link.href; a.target = '_blank'; a.rel = 'noopener noreferrer';
       a.append(node('span', /^open\b/i.test(link.label) ? link.label : 'Open ' + link.label)); primary.replaceChildren(a);
-    } else primary.replaceChildren(action('Reply', 'chat', () => startChat(it), 'btn-primary'));
+    } else if (canReply()) primary.replaceChildren(action('Reply', 'chat', () => startChat(it), 'btn-primary'));
+    else primary.replaceChildren();
     const acts = [];
-    if (link) acts.push(action('Reply', 'chat', () => startChat(it)));
+    if (link && canReply()) acts.push(action('Reply', 'chat', () => startChat(it)));
     // Mark read / unread is done with this one: back to the list, like Send in Chats returns to the session list.
-    acts.push(action(it.read ? 'Mark unread' : 'Mark read', it.read ? 'unread' : 'read', async () => {
-      const ok = await mark([it.id], {read: !it.read});
-      if (ok && selected && selected.id === it.id) closeDetail();
-    }));
+    acts.push(action(it.read ? 'Mark unread' : 'Mark read', it.read ? 'unread' : 'read', () => mark([it.id], {read: !it.read}, true)));
     acts.push(action(it.flag ? 'Unflag' : 'Flag', 'flag', () => mark([it.id], {flag: !it.flag})));
-    acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', () => mark([it.id], {archived: !it.archived})));
+    // Archive / Move to inbox finish this one too: back to the list, where the row has gone.
+    acts.push(action(it.archived ? 'Move to inbox' : 'Archive', it.archived ? 'inbox' : 'archive', () => mark([it.id], {archived: !it.archived}, true)));
     if (it.flag) acts.find(b => b.textContent === 'Unflag')?.setAttribute('aria-pressed', 'true');
     row.style.setProperty('--n', String(acts.length)); row.replaceChildren(...acts);
   }
-  async function load() {
+  async function load(force = false) {
+    if (busy && !force) return;
     const version = ++generation;
     const view = filter === 'unread' ? 'inbox' : filter;
     try {
       const result = await api('items?view=' + encodeURIComponent(view) + '&limit=500');
       if (version !== generation) return;
       if (!Array.isArray(result.items)) throw new Error('Notifications returned an invalid list.');
+      const fresh = !items.length;
       items = result.items;
       if (selected) selected = items.find(it => it.id === selected.id) || selected;
       // A background refresh never rebuilds an open detail (pictures and scroll stay put).
-      if (selected) paintList(); else paint();
+      if (selected) paintList(); else { paint(); if (fresh && narrow()) el('scroll').scrollTop = el('scroll').scrollHeight; }
       say('');
       const c = result.counts || {};
       if (parent !== window) parent.postMessage({type: 'wizard:notifications:count', unread: Number(c.unread) || 0, needs: Number(c.needs) || 0}, location.origin);
     } catch (error) { if (version === generation) say(error.message); }
   }
   function paintList() { if (strip.busy()) { strip.dirty = true; return; } const keep = selected; selected = null; const top = el('scroll').scrollTop; paint(); selected = keep; el('overview').hidden = true; el('detail').hidden = false; el('toolbar').hidden = true; document.documentElement.classList.add('nt-detail'); el('scroll').scrollTop = top; }
-  async function mark(ids, marks) {
+  async function mark(ids, marks, finish = false) {
     if (busy || !ids.length) return false;
-    busy = true; if (selected) paintActionsOnly();
+    busy = true; ++generation;
+    const previous = items, detail = selected;
+    const apply = it => ids.includes(it.id) ? {...it, ...marks, ...(marks.archived === true ? {read: true} : {})} : it;
+    items = items.map(apply); if (selected) selected = apply(selected);
+    // Paint the action before any network work; failed saves restore the prior marks.
+    if (finish) showList(); else paint();
+    say('Saving…');
     let ok = false;
     try {
       await api('mark', {ids, ...marks}); ok = true;
-      if (selected && ids.includes(selected.id)) selected = {...selected, ...marks, ...(marks.archived === true ? {read: true} : {})};
-      await load();
-    } catch (error) { say(error.message); }
+      await load(true);
+    } catch (error) { items = previous; if (selected && detail && selected.id === detail.id) selected = detail; paint(); say(error.message); }
     finally { busy = false; if (selected) paintActionsOnly(); }
     return ok;
   }
   function paintActionsOnly() { const top = el('scroll').scrollTop; paintDetail(); el('scroll').scrollTop = top; }
+  function saveListPlace() { const sc = el('scroll'); listTop = sc.scrollTop; listGap = Math.max(0, sc.scrollHeight - sc.scrollTop - sc.clientHeight); }
+  function toListPlace() { const sc = el('scroll'); sc.scrollTop = narrow() ? sc.scrollHeight - sc.clientHeight - listGap : listTop; }
   // Back to the list where it was: same scroll position, focus on the row without scrolling it.
   function showList() {
     if (!selected) return false;
-    const id = selected.id; selected = null; paint(); el('scroll').scrollTop = listTop;
+    const id = selected.id; selected = null; paint(); toListPlace();
     const row = [...document.querySelectorAll('.subject-row')].find(b => b.dataset.id === id); (row || el('scroll')).focus({preventScroll: true}); return true;
   }
   // Back (button, Escape, the shell's Back): on phone the list slides back in from the left, like Chats.
@@ -296,14 +318,14 @@
   el('list').onclick = e => {
     const b = e.target.closest('[data-id]'); if (!b || strip.busy()) return;
     const it = items.find(x => x.id === b.dataset.id); if (!it) return;
-    listTop = el('scroll').scrollTop;
+    saveListPlace();
     const ghost = strip.on() ? strip.snapshot() : null;
     selected = it; paint(); el('scroll').scrollTop = 0; el('subject').focus({preventScroll: true});
     if (ghost) strip.open(ghost);
   };
   document.querySelectorAll('[data-filter]').forEach(b => b.onclick = () => {
     disarmAllRead();
-    filter = b.dataset.filter; selected = null; el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('scroll').scrollTop = 0;
+    filter = b.dataset.filter; selected = null; el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); el('scroll').scrollTop = 0; listGap = 0;
     // Clear old rows while the new filter loads, never label stale data “All”.
     items = []; paint(); load();
   });
@@ -311,6 +333,7 @@
   el('viewer-close').onclick = closeViewer;
   el('viewer').onclick = e => { if (e.target === el('viewer')) closeViewer(); };
   el('more').onclick = () => { disarmAllRead(); el('options').hidden = !el('options').hidden; el('more').setAttribute('aria-expanded', String(!el('options').hidden)); };
+  document.addEventListener('click', e => { if (!el('options').hidden && !e.target.closest('#options, #more')) { el('options').hidden = true; el('more').setAttribute('aria-expanded', 'false'); } });
   el('refresh').onclick = load;
   el('allread').onclick = () => {
     const ids = visible().filter(it => !it.read).map(it => it.id);
@@ -327,6 +350,8 @@
   window.WizardApp?.ready({name: 'Notifications'});
   window.WizardApp?.back?.register?.({canGoBack: () => !!selected || !el('options').hidden || !el('viewer').hidden, back: () => window.__wizardCloseOverlay()});
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+  let wasNarrow = narrow();
+  addEventListener('resize', () => { if (narrow() === wasNarrow) return; wasNarrow = narrow(); if (selected) paintList(); else { paint(); el('scroll').scrollTop = narrow() ? el('scroll').scrollHeight : 0; } });
   setInterval(() => { if (!document.hidden && !busy) load(); }, 60000);
   load();
 })();

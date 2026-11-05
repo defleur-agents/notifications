@@ -10,14 +10,15 @@ def constants(path):
     return result
 class MinimalInboxTests(unittest.TestCase):
     def test_skin_gate(self):
-        gate = constants(ROOT/'mcp/minimal_assets.py')['MINIMAL_ASSETS']['layout.js'][1]
-        for skin in ['obsidian','obsidian-light','landscapes','nebula','grove','tide','ember','signal']:
+        ns = {}; exec((ROOT/'mcp/minimal_assets.py').read_text(), ns)
+        gate = ns['MINIMAL_ASSETS']['layout.js'][1]
+        for skin in ['obsidian','obsidian-light','landscapes','landscapes-light','nebula','grove','tide','ember','signal']:
             for minimal in [False, True]:
                 url = 'https://wizard.example/notifications/' + ('?layout=minimal' if minimal else '')
                 code = 'const vm=require("node:vm");let result=null;const location={href:'+json.dumps(url)+',replace:u=>result=u};const window={WizardApp:{theme:{onChange:fn=>fn({skin:'+json.dumps(skin)+'})}}};vm.runInNewContext('+json.dumps(gate)+',{window,location,URL,document:{documentElement:{dataset:{}}}});console.log(JSON.stringify(result));'
                 result = json.loads(subprocess.check_output(['node','-e',code]))
-                wanted = skin in ['obsidian','obsidian-light','landscapes']
-                self.assertEqual(result is not None, wanted != minimal)
+                wanted = skin in ['obsidian','obsidian-light','landscapes','landscapes-light']
+                self.assertEqual(result is not None, wanted and not minimal)
                 if result is not None: self.assertEqual('layout=minimal' in result, wanted)
     def test_original_screen_preserved(self):
         import hashlib
@@ -40,10 +41,16 @@ class MinimalInboxTests(unittest.TestCase):
     def test_swipe_strip_uses_chats_numbers_and_skin_gate(self):
         source = (ROOT/'web/minimal/inbox.js').read_text()
         for needle in ['LOCK = 10', 'RATIO = 1.3', 'GO = 70', 'VGO = 0.45', 'MS = 240', "EASE = 'cubic-bezier(.2,.8,.2,1)'", 'EDGE = 24',
-                       "new Set(['obsidian', 'obsidian-light', 'landscapes'])", 'innerWidth < 768']:
+                       "new Set(['obsidian', 'obsidian-light', 'landscapes', 'landscapes-light'])", 'innerWidth < 768']:
             self.assertIn(needle, source)
         self.assertNotIn('setTimeout(', source.split('const strip')[1].split('window.__ntStrip')[0])
     def test_mark_unread_never_wraps(self):
         css = (ROOT/'web/minimal/styles.css').read_text()
         self.assertIn('.act span { max-width: 100%; white-space: nowrap;', css)
+    def test_front_fits_one_exec_argument(self):
+        # Linux refuses any single exec argument over 128 KiB ("argument list too long"): the inlined front is one.
+        text = (ROOT/'runtipi/docker-compose.yml').read_text()
+        block = text.split('# BEGIN MCP FRONT', 1)[1].split('# END MCP FRONT', 1)[0].split('\n', 2)[2]
+        self.assertGreater(len(block), 10000)
+        self.assertLess(len(block.encode()), 120 * 1024)   # with indentation, so the real argument is smaller still
 if __name__ == '__main__': unittest.main()

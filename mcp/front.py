@@ -25,6 +25,7 @@ MAX_HEAD = 65536
 MAX_BODY = 1 << 20
 TOOLS = {}
 ROUTES = {}  # path prefix -> fn(method, path, query, headers, body) -> (status, content_type, bytes); app pages and APIs
+STREAMS = {}  # exact path -> async fn(reader, writer, method, target, rest): a response that stays open (event streams)
 REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
 
 
@@ -43,12 +44,21 @@ def route(prefix):
     return deco
 
 
+def stream(path):
+    def deco(fn):
+        STREAMS[path] = fn
+        return fn
+    return deco
+
+
 async def serve_route(reader, writer, fn, method, target, rest):
     headers = {}
     for line in rest.decode("latin-1").split("\r\n"):
         if ":" in line:
             k, v = line.split(":", 1)
             headers[k.strip().lower()] = v.strip()
+    # The caller's address, under a key no request header can produce (header names never start with ':').
+    headers[":peer"] = (writer.get_extra_info("peername") or ("",))[0]
     n = int(headers.get("content-length") or 0)
     if n > MAX_BODY:
         return await respond(writer, 413, {"error": "request too large"})
@@ -82,7 +92,12 @@ def http(method, path, body=None, headers=None, timeout=60):
         with open(password_file) as f:
             password = f.read().strip()
         req.add_header("Authorization", "Basic " + base64.b64encode(("readable:" + password).encode()).decode())
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    # Authenticated engine requests never follow a redirect or environment proxy.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    with opener.open(req, timeout=timeout) as r:
         return r.status, r.read()
 
 
@@ -134,16 +149,54 @@ async def respond(writer, code, obj=None, extra=""):
         writer.close()
 
 
-async def mcp(reader, writer, method, rest):
+def parse_headers(rest):
     headers = {}
     for line in rest.decode("latin-1").split("\r\n"):
         if ":" in line:
             k, v = line.split(":", 1)
             headers[k.strip().lower()] = v.strip()
+    return headers
+
+
+def networked(headers):
+    """The request came through Tailscale Serve, a tunnel or a proxy (not from an app on this box)."""
+    return any(k.startswith(("tailscale-", "x-forwarded-", "cf-")) or k in ("forwarded", "x-real-ip") for k in headers)
+
+
+GET_PUBLISH = ("/publish", "/send", "/trigger")  # ntfy also publishes on GET /<topic>/publish?message=...
+
+
+def cross_site(method, path, headers):
+    """A browser request made by a page on another origin: another website, or another app's port on this box.
+    ntfy answers every request with Access-Control-Allow-Origin: * (its built-in default, not configurable in
+    v2.29) and has no login here, so such a page could read and publish the owner's notifications. The ntfy web
+    app (same origin) and the ntfy phone apps (no browser headers) are unaffected; a link that opens the web app
+    in a tab is a top-level visit and still works."""
+    host = headers.get("host", "").lower()
+    origin = headers.get("origin")
+    if origin is not None and (origin == "null" or urllib.parse.urlsplit(origin).netloc.lower() != host):
+        return True
+    publish = method in ("GET", "HEAD") and path.rstrip("/").endswith(GET_PUBLISH) and path.rstrip("/").count("/") == 2
+    if headers.get("sec-fetch-site", "") in ("cross-site", "same-site"):
+        visit = (method in ("GET", "HEAD") and headers.get("sec-fetch-mode") == "navigate"
+                 and headers.get("sec-fetch-dest") == "document")
+        if not visit or publish:
+            return True
+    # Browsers without Fetch Metadata still send the linking page as Referer on an <img>/<script> GET.
+    ref = headers.get("referer")
+    return bool(publish and ref and urllib.parse.urlsplit(ref).netloc.lower() != host)
+
+
+async def mcp(reader, writer, method, rest):
+    headers = parse_headers(rest)
     if MCP_TOKEN:
         import hmac
         if not hmac.compare_digest(headers.get("authorization", "").encode(), ("Bearer " + MCP_TOKEN).encode()):
             return await respond(writer, 401, {"error": "this MCP needs Authorization: Bearer <token>"}, 'WWW-Authenticate: Bearer\r\n')
+    elif networked(headers):
+        # Without a token the MCP is for apps on this box only, the handshake (initialize, tools/list) included,
+        # like every tool already is (_box_only).
+        return await respond(writer, 403, {"error": "this MCP is only for apps on this box"})
     if method != "POST":
         return await respond(writer, 405, {"error": "use POST %s" % MCP_PATH}, "Allow: POST\r\n")
     n = int(headers.get("content-length") or 0)
@@ -189,13 +242,18 @@ async def handle(reader, writer):
     line, _, rest = head.partition(b"\r\n")
     parts = line.decode("latin-1").split(" ")
     path = parts[1].split("?", 1)[0] if len(parts) >= 3 else ""
-    if path == MCP_PATH:
-        return await mcp(reader, writer, parts[0], rest)
-    for prefix, fn in ROUTES.items():
+    if path in STREAMS:
+        return await STREAMS[path](reader, writer, parts[0], parts[1], rest)
+    for prefix, fn in sorted(ROUTES.items(), key=lambda r: -len(r[0])):   # the most specific prefix wins
         if path == prefix.rstrip("/") or path.startswith(prefix):
             return await serve_route(reader, writer, fn, parts[0], parts[1], rest)
-    # ntfy publishes on POST/PUT and GET /topic/publish. Never proxy these raw.
-    if parts[0] in ("POST", "PUT") or (parts[0] == "GET" and path.endswith("/publish")):
+    if cross_site(parts[0], path, parse_headers(rest)):
+        # No Access-Control-* header: the page that sent it can neither read the answer nor pass a preflight.
+        return await respond(writer, 403, {"error": "cross-site requests are refused"})
+    if path == MCP_PATH:
+        return await mcp(reader, writer, parts[0], rest)
+    # Specific app/phone routes above own their authentication. Generic ntfy ingress is guarded first.
+    if parts[0] in ("POST", "PUT") or (parts[0] == "GET" and path.rstrip("/").endswith(GET_PUBLISH) and path.rstrip("/").count("/") == 2):
         return await serve_route(reader, writer, publish_route, parts[0], parts[1], rest)
     if not UP_HOST:
         return await respond(writer, 404, {"error": "not found"})

@@ -2,6 +2,7 @@
 :root {
   /* One solid page: the skin's own opaque base colour, so a bright photo never shows through text or buttons. */
   --nt-page: var(--wz-base, var(--canvas));
+  --nt-solid: var(--wz-base, var(--canvas));
   --nt-btn: color-mix(in srgb, var(--ink) 9%, var(--nt-page));
   --nt-btn-line: color-mix(in srgb, var(--ink) 42%, var(--nt-page));
   --nt-link: color-mix(in srgb, var(--accent) 80%, var(--ink));
@@ -25,14 +26,16 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .unread .dot { background: var(--accent); }
 
 /* ---- bottom filter bar (list only) ---- */
-.nt-toolbar { flex: none; position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 18px max(44px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--nt-page); }
+.nt-toolbar { flex: none; position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 18px 12px; border-top: 1px solid var(--line); background: var(--nt-page); }
+html[data-presentation="immersive"] .nt-toolbar { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 .nt-filters { display: flex; border-radius: 99px; background: var(--nt-btn); border: 1px solid var(--line-2); padding: 3px; }
 .nt-filters button { min-width: 92px; padding: 0 18px; border-radius: 99px; color: var(--ink-2); font-weight: 550; }
 /* The selected filter is a solid ink pill; its label uses the skin's opaque base colour, never --nt-page
    (transparent on the glass skins, which made "Unread" invisible on Nebula, Grove, Tide, Ember and Signal). */
 .nt-filters button[aria-pressed="true"] { background: var(--ink); color: var(--wz-base, var(--canvas)); font-weight: 700; }
+.nt-more.on { background: var(--ink); color: var(--nt-solid); border-color: var(--ink); font-weight: 700; }
 .nt-more { color: var(--ink); padding: 0 14px; border-radius: 99px; border: 1px solid var(--line-2); background: var(--nt-btn); font-weight: 550; }
-.nt-options { position: absolute; right: 18px; bottom: calc(100% + 4px); min-width: 180px; padding: 8px; border: 1px solid var(--nt-btn-line); border-radius: 16px; background: var(--nt-page); box-shadow: 0 10px 36px var(--line); z-index: 3; }
+.nt-options { position: absolute; right: 18px; bottom: calc(100% + 4px); min-width: 180px; padding: 8px; border: 1px solid var(--nt-btn-line); border-radius: 16px; background: var(--nt-solid); box-shadow: 0 10px 36px var(--line); z-index: 3; }
 .nt-options button { display: block; width: 100%; padding: 0 12px; text-align: left; border-radius: 8px; }
 .nt-options button:hover { background: var(--fill); }
 
@@ -64,7 +67,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 html.nt-detail .wz-scroll { padding-bottom: max(140px, calc(env(safe-area-inset-bottom) + 120px)); }
 
 /* ---- picture viewer (fallback when the shell's viewer is not available) ---- */
-#viewer { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px 12px 120px; background: var(--nt-page); }
+#viewer { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px 12px 120px; background: var(--nt-solid); }
 #viewer img { max-width: 100%; max-height: 75vh; object-fit: contain; border-radius: 10px; }
 #viewer-close { min-width: 120px; padding: 0 20px; border-radius: 99px; border: 1px solid var(--nt-btn-line); background: var(--nt-btn); color: var(--ink); font-weight: 600; }
 
@@ -106,11 +109,11 @@ html.nt-sliding { -webkit-user-select: none; user-select: none; }
 /* Every other skin (Nebula, Grove, Tide, Ember, Signal...): wear the skin like Chats does. The window stays
    transparent so the skin's own window glass and backdrop show through; controls use the skin's surface tokens;
    the bottom bar gets an opaque skin backing so the list never shows through it. Miguel's skins keep the solid page. */
-html.wz-hosted:not([data-skin="obsidian"]):not([data-skin="obsidian-light"]):not([data-skin="landscapes"]) {
+html.wz-hosted:not([data-skin="obsidian"]):not([data-skin="obsidian-light"]):not([data-skin="landscapes"]):not([data-skin="landscapes-light"]) {
   --nt-page: transparent;
   --nt-btn: var(--wz-surface, color-mix(in srgb, var(--ink) 8%, transparent));
   --nt-btn-line: var(--wz-border, var(--line-2));
 }
-html.wz-hosted:not([data-skin="obsidian"]):not([data-skin="obsidian-light"]):not([data-skin="landscapes"]) .nt-toolbar {
+html.wz-hosted:not([data-skin="obsidian"]):not([data-skin="obsidian-light"]):not([data-skin="landscapes"]):not([data-skin="landscapes-light"]) .nt-toolbar {
   background: linear-gradient(var(--wz-overlay, transparent), var(--wz-overlay, transparent)), var(--wz-base, var(--canvas));
 }
