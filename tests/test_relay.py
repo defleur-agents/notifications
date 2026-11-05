@@ -62,6 +62,18 @@ class RelayTests(unittest.TestCase):
         self.add("job1", "b.md", run_md(status="silent"), self.t0 + 1)
         self.assertEqual(self.run_once()["sent"], 0); self.assertEqual(self.posts, [])
 
+    def test_silent_marker_on_its_own_last_or_first_line_posts_nothing(self):
+        # Hermes delivers nothing for these (autonomous silence rule); they reached the inbox as unreadable badges.
+        for i, r in enumerate(("Already logged; the change is just Unread to Read.\n\n[SILENT]",
+                               "Both already logged; watcher recovered.\n\n[SILENT]",
+                               "[SILENT]\nNothing new.", "[SILENT] no changes", "silent")):
+            self.add("job1", f"s{i}.md", run_md(response=r), self.t0 + i)
+        self.assertEqual(self.run_once()["sent"], 0); self.assertEqual(self.posts, [])
+
+    def test_marker_mid_sentence_still_posts(self):
+        self.add("job1", "m.md", run_md(response="Buyer asked whether to stay [SILENT] on price; reply drafted."), self.t0)
+        self.assertEqual(self.run_once()["sent"], 1)
+
     def test_same_failure_quiet_for_a_day_then_reminds(self):
         self.add("job1", "1.md", run_md(status="error", error="disk full"), self.t0)
         self.add("job1", "2.md", run_md(status="error", error="disk full"), self.t0 + 600)
