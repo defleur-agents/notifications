@@ -2,6 +2,8 @@
  const ours = new Set(['obsidian','obsidian-light','landscapes','landscapes-light']);
  // A deliberate view selection never gets overwritten by a skin change.
  if (new URL(location.href).searchParams.has('layout')) return;
+ // The card document is already skin-independent; never remount it when Appearance arrives.
+ if (document.querySelector?.('script[src="minimal-boot.js"]')) return;
  const minimal = new URL(location.href).searchParams.get('layout') === 'minimal';
  window.WizardApp?.theme.onChange(theme => {
    const skin = theme?.skin?.id || theme?.skin || document.documentElement.dataset.skin;

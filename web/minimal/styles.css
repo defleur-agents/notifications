@@ -2,7 +2,7 @@
 :root {
   /* One solid page: the skin's own opaque base colour, so a bright photo never shows through text or buttons. */
   --nt-page: var(--wz-base, var(--canvas));
-  --nt-solid: var(--wz-base, var(--canvas));
+  --nt-solid: var(--wz-panel, var(--wz-base, var(--canvas)));
   --nt-btn: color-mix(in srgb, var(--ink) 9%, var(--nt-page));
   --nt-btn-line: color-mix(in srgb, var(--ink) 42%, var(--nt-page));
   --nt-link: color-mix(in srgb, var(--accent) 80%, var(--ink));

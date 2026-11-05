@@ -9,6 +9,10 @@ def constants(path):
             except (ValueError, TypeError, AttributeError): pass
     return result
 class MinimalInboxTests(unittest.TestCase):
+    def test_default_cards_never_reload_on_appearance_arrival(self):
+        gate = (ROOT/'web/minimal/layout.js').read_text()
+        code = 'const vm=require("node:vm");const location={href:"https://fixture.invalid/notifications/",replace:()=>{throw Error("remount")}};const window={WizardApp:{theme:{onChange:()=>{throw Error("card skin redirect listener")}}}};vm.runInNewContext('+json.dumps(gate)+',{window,location,URL,document:{querySelector:()=>({})}});'
+        subprocess.check_call(['node','-e',code])
     def test_skin_gate(self):
         ns = {}; exec((ROOT/'mcp/minimal_assets.py').read_text(), ns)
         gate = ns['MINIMAL_ASSETS']['layout.js'][1]
