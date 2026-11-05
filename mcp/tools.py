@@ -302,8 +302,9 @@ def set_inbox_source(app, chats=None, phone=None):
 # ---- Routes: where each source's notifications go, ONE place each (Miguel, 2 Nov 2026) ----
 # Chats (a thread that waits), Badge (a count on its icon), Morning report ("daily": one line in tomorrow's report) or Off (only
 # this app's history). Stored on the box, so every device shows the same choice. Sources: an app id, "notifications"
-# (the agent's own alerts) or "system:<kind>" for notices about Wizard itself. Daily is for Notifications and System
-# only: an app's own items (Mail, Messenger) would lose their point if they waited a day.
+# (the agent's own alerts) or "system:<kind>" for notices about Wizard itself. Daily is for System only: an app's own
+# items (Mail, Messenger) would lose their point if they waited a day. The agent's own alerts (about no app) only ever
+# wait in Chats (Miguel, 5 Nov 2026): no Badge, Daily or Off, so the owner fixes their cause or gives the noise an app.
 ROUTES_FILE = os.environ.get("INBOX_ROUTES", os.path.join(os.path.dirname(STATE_FILE) or ".", "routes.json"))
 ROUTE_TO = ("chats", "badge", "daily", "off")
 SYSTEM_KINDS = {
@@ -344,7 +345,13 @@ def _daily_ok(i):
     return i == "notifications" or i.startswith("system:") or _report_id(i)
 
 
+CHATS_ONLY = ("notifications",)
+CHATS_ONLY_MSG = "The agent's own notifications always wait in Chats"
+
+
 def _route_ok(k, v):
+    if k in CHATS_ONLY:
+        return v == "chats"
     if v not in ROUTE_TO or (v == "daily" and not _daily_ok(k)):
         return False
     return v in REPORT_TO if k.startswith("report:") else True
@@ -367,7 +374,11 @@ def inbox_routes():
             d = json.load(f)
     except (OSError, ValueError):
         d = {}
-    saved = _clean_routes(d.get("routes") if isinstance(d, dict) else None)
+    raw = d.get("routes") if isinstance(d, dict) else None
+    saved = _clean_routes(raw)
+    for k in CHATS_ONLY:   # an old saved Badge/Daily/Off for them reads as Chats
+        if isinstance(raw, dict) and k in raw:
+            saved[k] = "chats"
     return {"routes": saved, "defaults": dict(ROUTE_DEFAULTS), "names": ROUTE_NAMES, "report": REPORT_ROUTES,
             "saved": bool(saved) or bool(isinstance(d, dict) and d.get("saved"))}
 
@@ -381,6 +392,8 @@ def set_inbox_routes(changes):
             raise ValueError("unknown source: %s" % str(k)[:70])
         if v not in ROUTE_TO:
             raise ValueError("route must be chats, badge, daily or off")
+        if k in CHATS_ONLY and v != "chats":
+            raise ValueError(CHATS_ONLY_MSG)
         if v == "daily" and not _daily_ok(k):
             raise ValueError("%s can't wait for the morning report" % k)
         if k.startswith("report:") and v not in REPORT_TO:

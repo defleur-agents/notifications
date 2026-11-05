@@ -62,8 +62,37 @@ class RouteTests(unittest.TestCase):
         for bad in ({"messenger": "daily"}, {"messenger": "mute"}, {"system:nope": "off"}, {"Bad Id": "off"}, {}):
             code, d = self.call("POST", "api/routes", {"routes": bad})
             self.assertEqual(code, 400, bad)
-        code, _ = self.call("POST", "api/routes", {"routes": {"notifications": "daily"}})
-        self.assertEqual(code, 200, "Notifications' own alerts can be Daily")
+        code, _ = self.call("POST", "api/routes", {"routes": {"system:app-updates": "daily"}})
+        self.assertEqual(code, 200, "System notices can be Daily")
+
+    def test_agent_notes_only_wait_in_chats(self):
+        """The agent's own alerts (about no app) can't go to Badge, Daily or Off (Miguel, 5 Nov 2026); System keeps its choices."""
+        for to in ("badge", "daily", "off"):
+            code, d = self.call("POST", "api/routes", {"routes": {"notifications": to}})
+            self.assertEqual(code, 400, to)
+            self.assertIn("always wait in Chats", d.get("error", ""))
+        code, d = self.call("POST", "api/routes", {"routes": {"notifications": "off", "messenger": "badge"}})
+        self.assertEqual(code, 400, "a mixed change is refused whole")
+        self.assertEqual(self.call("GET", "api/routes")[1]["routes"], {}, "nothing written")
+        code, d = self.call("POST", "api/routes", {"routes": {"notifications": "chats", "system:app-updates": "off"}})
+        self.assertEqual(code, 200)
+        self.assertEqual(d["routes"], {"notifications": "chats", "system:app-updates": "off"})
+        # an old routes.json with Off for them reads as Chats; the rest stays as saved
+        Path(self.ns["ROUTES_FILE"]).write_text(json.dumps({"routes": {"notifications": "off", "messenger": "badge"}, "saved": True}))
+        got = self.ns["inbox_routes"]()
+        self.assertEqual(got["routes"], {"notifications": "chats", "messenger": "badge"})
+        self.assertFalse(self.ns["_route_ok"]("notifications", "badge"))
+        self.assertTrue(self.ns["_route_ok"]("messenger", "off"))
+
+    def test_agent_notes_never_roll_into_the_morning_report(self):
+        Path(self.ns["ROUTES_FILE"]).write_text(json.dumps({"routes": {"notifications": "daily"}, "saved": True}))
+        real = self.ns["time"].time
+        self.ns["time"].time = lambda: NOW
+        try:
+            _, d = self.call("GET", "api/daily")
+        finally:
+            self.ns["time"].time = real
+        self.assertNotIn("notifications", [g["source"] for g in d["groups"]])
 
     def test_report_sections_are_daily_or_off(self):
         """Morning Report sections (report:<id>) default to the report; Off drops them; Chats/Badge are refused for now."""

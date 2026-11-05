@@ -94,6 +94,8 @@ def _db():
 
 
 def phone_route(app):
+    if app in CHATS_ONLY:
+        return "chats"
     r = inbox_routes()
     return {**r["defaults"], **r["routes"]}.get(app, "badge")   # an app nobody picked is a Badge (shell default)
 
