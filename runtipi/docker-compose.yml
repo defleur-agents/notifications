@@ -17,7 +17,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: notifications
-      APP_VERSION: 2.29.0-wizard24
+      APP_VERSION: 2.29.0-wizard25
       FRONT_PORT: '8080'
       UPSTREAM_HOST: notifications-engine
       UPSTREAM_PORT: '8080'
@@ -1210,6 +1210,21 @@ services:
           return (rest[:nxt.start()] if nxt and name != "Response" else rest).strip()
 
 
+      _SILENT_LINE = re.compile(r"\[?\s*(SILENT|NO[_ ]REPLY)\s*\]?[.!]?", re.I)
+
+
+      def cron_silent(body):
+          """Hermes' own rule for autonomous runs (gateway.response_filters.is_autonomous_silence_response): the marker as
+          the whole answer, on its own first or last line, or opening it as "[SILENT] ...". Agents often add a short note
+          before it ("Already logged.\n\n[SILENT]"); Hermes delivers nothing then, so neither may the inbox."""
+          lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+          if not lines:
+              return True
+          if body.upper().startswith(("[SILENT]", "[NO_REPLY]", "[NO REPLY]")):
+              return True
+          return any(_SILENT_LINE.fullmatch(c) for c in (body.strip(), lines[0], lines[-1]))
+
+
       def cron_summarize(text):
           """(failed, body) for a run worth telling the owner about, or None when the run is silent."""
           status = (re.search(r"^\*\*Status:\*\*[ \t]*(.+)", text, re.M) or [None, ""])[1].strip()
@@ -1225,7 +1240,7 @@ services:
                   parts = re.split(r"^---%s" % _EOL, text, maxsplit=1, flags=re.M)
                   body = parts[1] if len(parts) > 1 else text.split(status, 1)[-1] if status else ""
           body = body.strip()
-          if not body or body in ("[SILENT]", "SILENT"):
+          if not body or cron_silent(body):
               return None
           head = body[:240].lower()
           if re.search(r"\b(failed|failure|needs review|needs you|error|stale|not_started|action required)\b", head) and \
