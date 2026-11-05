@@ -60,6 +60,10 @@ class RouterTests(unittest.TestCase):
     def sid(self):
         return self.ns["phone_since"](0, "")["sid"]
 
+    def test_agent_notes_route_as_chats(self):
+        Path(self.ns["ROUTES_FILE"]).write_text(json.dumps({"routes": {"notifications": "off"}, "saved": True}))
+        self.assertEqual(self.ns["phone_route"]("notifications"), "chats")
+
     def test_apps_are_badges_until_routed_to_chats(self):
         self.assertEqual(self.ns["phone_route"]("messenger"), "badge")
         self.assertEqual(self.ns["ingest_feed"]("messenger", feed(CARLOS)), 1)
