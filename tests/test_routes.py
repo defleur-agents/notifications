@@ -16,13 +16,18 @@ MSGS = [
 ]
 
 
+def newest_first(msgs):
+    """What the real _messages() hands the inbox: newest first (mcp/tools.py sorts by time, descending, stably)."""
+    return [dict(m, event="message") for m in sorted(msgs, key=lambda m: -m["time"])]
+
+
 def load(state):
     os.environ["INBOX_STATE"] = state
     os.environ.pop("INBOX_ROUTES", None)
     src = (ROOT / "mcp/front.py").read_text() + "\n" + (ROOT / "mcp/tools.py").read_text() + "\n" + (ROOT / "mcp/minimal_assets.py").read_text()
     ns = {"__name__": "notif_test"}
     exec(compile(src, "front+tools", "exec"), ns)
-    ns["_messages"] = lambda since="all": [dict(m, event="message") for m in MSGS]
+    ns["_messages"] = lambda since="all": newest_first(MSGS)
     return ns
 
 
@@ -122,7 +127,31 @@ class RouteTests(unittest.TestCase):
         got = {g["source"]: [i["id"] for i in g["items"]] for g in d["groups"]}
         self.assertEqual(got, {"system:app-updates": ["u1"], "system:connections": ["c1"]},
                          "the failed update and the cron result are not rolled up; the 30-hour-old one is out")
-        self.assertEqual([g["name"] for g in d["groups"]], ["App updates", "App connections"])
+        # Groups follow the inbox: the source with the newest item first (connections c1 is newer than updates u1).
+        self.assertEqual([g["name"] for g in d["groups"]], ["App connections", "App updates"])
+
+    def daily_groups(self, feed):
+        """Daily groups when the feed is handed over in exactly this order (not pre-sorted)."""
+        self.ns["_messages"] = lambda since="all": [dict(m, event="message") for m in feed]
+        real = self.ns["time"].time
+        self.ns["time"].time = lambda: NOW
+        try:
+            code, d = self.call("GET", "api/daily")
+        finally:
+            self.ns["time"].time = real
+        self.assertEqual(code, 200)
+        return [g["name"] for g in d["groups"]]
+
+    def test_daily_group_order_is_newest_first_whatever_order_the_feed_arrives_in(self):
+        import itertools
+        for feed in itertools.permutations(MSGS):
+            self.assertEqual(self.daily_groups(feed), ["App connections", "App updates"], [m["id"] for m in feed])
+
+    def test_daily_group_order_ties_keep_the_feed_order(self):
+        tied = [dict(m, time=NOW - 3000) for m in MSGS if m["id"] in ("u1", "c1")]
+        self.assertEqual(self.daily_groups(tied), ["App updates", "App connections"])
+        self.assertEqual(self.daily_groups(tied[::-1]), ["App connections", "App updates"])
+        self.assertEqual(self.daily_groups(tied), self.daily_groups(tied), "same feed, same order")
 
     def test_off_is_not_daily(self):
         self.call("POST", "api/routes", {"routes": {"system:app-updates": "off"}})

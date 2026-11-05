@@ -33,11 +33,16 @@ function changed(a, b) {
 async function opaque(page, frame, label) {
   const menu = frame.locator('#options');
   const box = await menu.boundingBox(); assert(box && box.width > 40);
-  const clip = {x: Math.ceil(box.x)+2, y: Math.ceil(box.y)+2, width: Math.floor(box.width)-4, height: Math.floor(box.height)-4};
+  // Inset past the rounded corners (a rectangle d in from each corner is inside the arc once d >= 0.293 r), so only panel pixels are compared.
+  const radius = await menu.evaluate(e => parseFloat(getComputedStyle(e).borderTopLeftRadius) || 0), inset = Math.ceil(radius * 0.3) + 3;
+  const clip = {x: Math.ceil(box.x)+inset, y: Math.ceil(box.y)+inset, width: Math.floor(box.width)-2*inset, height: Math.floor(box.height)-2*inset};
+  assert(clip.width > 40 && clip.height > 40, 'panel too small to compare');
   await frame.evaluate(() => {
+    // Cover the panel's real rectangle (the bar is at the bottom on phone and at the top on wide windows), one layer below it.
+    const bar = document.querySelector('#toolbar'), o = document.querySelector('#options').getBoundingClientRect(), t = bar.getBoundingClientRect();
     const e = document.createElement('div'); e.id='pixel-canary';
-    Object.assign(e.style,{position:'absolute',right:'18px',bottom:'calc(100% + 4px)',width:'280px',height:'240px',fontSize:'28px',zIndex:'2',background:'magenta',color:'lime',pointerEvents:'none'});
-    e.textContent='LOUD SYNTHETIC TEXT '.repeat(30); document.querySelector('#toolbar').append(e);
+    Object.assign(e.style,{position:'absolute',left:(o.left-t.left-bar.clientLeft-12)+'px',top:(o.top-t.top-bar.clientTop-12)+'px',width:(o.width+24)+'px',height:(o.height+24)+'px',overflow:'hidden',fontSize:'28px',zIndex:'2',background:'magenta',color:'lime',pointerEvents:'none'});
+    e.textContent='LOUD SYNTHETIC TEXT '.repeat(60); bar.append(e);
   });
   await settle(frame);
   const loud = await page.screenshot({clip});
@@ -76,17 +81,22 @@ async function opaque(page, frame, label) {
           await frame.waitForFunction(s => document.documentElement.dataset.skin===s,skin);
           await page.waitForFunction(()=>WizAppearance.inspect().every(s=>s.acked));
           assert.equal(await frame.evaluate(()=>window.__identity),identity,'skin change remounted app');
-          await frame.locator('.subject-row').filter({hasText:/Backup check/i}).click();
+          // The row shows the readable title (quiet FYI); the job's own wording is kept in Details, per run.
+          await frame.locator('.subject-row').filter({hasText:/Readable backup update/i}).click();
           await frame.locator('#runs details').first().waitFor();
-          assert.equal(await frame.locator('.run').count(),2);
-          await frame.locator('#runs details').first().locator('summary').first().click();
+          assert.equal(await frame.locator('#runs li').count(),1,'one earlier run beside the newest');
+          assert.match(await frame.locator('#body details pre').textContent(),/Recovered: Backup check[\s\S]*Synthetic original second run/,'newest run original details');
+          await frame.locator('#runs li > details > summary').click();
+          await frame.locator('#runs li > details > details > summary').click();
+          await frame.locator('#runs li > details > details pre').waitFor({state:'visible'});
+          assert.match(await frame.locator('#runs li > details > details pre').textContent(),/Backup check[\s\S]*Synthetic original first run/,'earlier run original details');
           await settle(frame);
           const shot = path.join(OUT,profile+'-'+skin+'-runs.png'); await page.screenshot({path:shot}); row.screenshots.push({file:path.basename(shot),sha256:hash(fs.readFileSync(shot))});
           // Shared app Back closes the detail, never exits the fixture.
           await frame.locator('#subject').press('Escape');
           await frame.locator('#overview').waitFor({state:'visible'});
           await frame.locator('#more').click(); await opaque(page,frame,profile+'-'+skin);
-          await frame.locator('#filters').click({position:{x:1,y:1}});
+          await frame.locator('#toolbar').click({position:{x:4,y:4}});
           await frame.locator('#options').waitFor({state:'hidden'});
           assert(await frame.evaluate(()=>document.documentElement.scrollWidth <= innerWidth));
         }

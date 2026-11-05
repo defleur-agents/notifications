@@ -29,11 +29,17 @@ def main():
     assert (shell / 'core/app-client.js').is_file()
     with tempfile.TemporaryDirectory() as tmp:
         ns = load(Path(tmp))
-        for title, message in [('Backup check', 'Synthetic original first run'), ('Recovered: Backup check', 'Synthetic original second run')]:
-            ns['rewrite_and_deliver']({'topic': 'cron', 'title': title, 'message': message, 'tags': ['cron', 'app:backup']},
-                rewrite=lambda p: ({'verdict': 'fyi', 'title': 'Readable backup update', 'body': 'The backup finished. Nothing to do.'}, DONE))
+        # Fixed stamps: the newer run is always the head, so the browser checks never race the wall clock.
+        def stamp(out, at):
+            with ns['readable_db']() as db:
+                db.execute('UPDATE updates SET at=? WHERE id=?', (at, out['rewrite_id']))
+        for title, message, at in [('Backup check', 'Synthetic original first run', 1999990000),
+                                   ('Recovered: Backup check', 'Synthetic original second run', 1999990100)]:
+            stamp(ns['rewrite_and_deliver']({'topic': 'cron', 'title': title, 'message': message, 'tags': ['cron', 'app:backup']},
+                rewrite=lambda p: ({'verdict': 'fyi', 'title': 'Readable backup update', 'body': 'The backup finished. Nothing to do.'}, DONE)), at)
         note = ns['rewrite_and_deliver']({'topic': 'wizard', 'title': 'Fixture FYI', 'message': 'Synthetic original FYI details'},
             rewrite=lambda p: ({'verdict': 'fyi', 'title': 'Fixture FYI', 'body': 'The fixture check completed. Nothing to do.'}, DONE))
+        stamp(note, 1999980000)
         messages = [{'event': 'message', 'id': 'fixture-needs-you', 'title': 'Fixture needs you', 'message': 'Choose a time for the synthetic check.', 'time': 2000000000, 'priority': 4}]
         ns['http'] = lambda method, path, **kw: (200, ('\n'.join(json.dumps(m) for m in messages) if path.startswith('/wizard/') else '').encode())
 
