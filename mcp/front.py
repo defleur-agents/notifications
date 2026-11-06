@@ -216,5 +216,17 @@ async def handle(reader, writer):
 
 async def main():
     srv = await asyncio.start_server(handle, os.environ.get("FRONT_BIND", "0.0.0.0"), PORT, limit=MAX_HEAD)
+    mail_srv = None
+    if os.environ.get("MAIL_SOCKET_ENABLED", "off") == "on":
+        try:
+            mail_srv = await start_mail_socket()
+        except Exception:
+            # An optional Mail route cannot take the existing inbox/TCP/cron front down.
+            print("Mail notification socket unavailable; existing Notifications front stays active", flush=True)
     async with srv:
-        await srv.serve_forever()
+        try:
+            await srv.serve_forever()
+        finally:
+            if mail_srv:
+                mail_srv.close()
+                await mail_srv.wait_closed()

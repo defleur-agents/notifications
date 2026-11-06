@@ -28,7 +28,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .nt-toolbar { flex: none; position: relative; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 10px 18px max(44px, env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--nt-page); }
 .nt-filters { display: flex; border-radius: 99px; background: var(--nt-btn); border: 1px solid var(--line-2); padding: 3px; }
 .nt-filters button { min-width: 92px; padding: 0 18px; border-radius: 99px; color: var(--ink-2); font-weight: 550; }
-.nt-filters button[aria-pressed="true"] { background: var(--ink); color: var(--nt-page); font-weight: 700; }
+/* The selected filter is a solid ink pill; its label uses the skin's opaque base colour, never --nt-page
+   (transparent on the glass skins, which made "Unread" invisible on Nebula, Grove, Tide, Ember and Signal). */
+.nt-filters button[aria-pressed="true"] { background: var(--ink); color: var(--wz-base, var(--canvas)); font-weight: 700; }
 .nt-more { color: var(--ink); padding: 0 14px; border-radius: 99px; border: 1px solid var(--line-2); background: var(--nt-btn); font-weight: 550; }
 .nt-options { position: absolute; right: 18px; bottom: calc(100% + 4px); min-width: 180px; padding: 8px; border: 1px solid var(--nt-btn-line); border-radius: 16px; background: var(--nt-page); box-shadow: 0 10px 36px var(--line); z-index: 3; }
 .nt-options button { display: block; width: 100%; padding: 0 12px; text-align: left; border-radius: 8px; }

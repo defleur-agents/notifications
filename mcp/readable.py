@@ -176,6 +176,8 @@ def fallback_excerpt(text, sentences):
 
 
 def _deliver_readable(uid, payload, result):
+    if uid.startswith("mail-") and not mail_grant_hashes():
+        raise PermissionError("Mail grant revoked")
     if result["verdict"] != "needs_you":
         return {"id": uid, "event": "message", "topic": "inbox", "priority": 1, "sent": False, "pushed": False, **result}
     topic = payload.get("topic") or TOPIC
@@ -250,6 +252,8 @@ def readable_retry_once():
     with readable_db() as db:
         rows = db.execute("SELECT id,raw FROM updates WHERE pending=1 AND retry_at<=? LIMIT 10", (int(time.time()),)).fetchall()
     for row in rows:
+        if row["id"].startswith("mail-") and not mail_grant_hashes():
+            continue  # Revocation also closes pending Mail-only editor/delivery retries.
         try:
             rewrite_and_deliver(json.loads(row["raw"]), row["id"])
         except Exception as error:
